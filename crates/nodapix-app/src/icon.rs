@@ -96,6 +96,7 @@ impl LucideIcon {
     }
 
     /// Build a GPUI SVG element inheriting text_color from parent style context.
+    #[allow(dead_code)]
     pub fn icon(self, size: f32) -> Svg {
         svg()
             .data(self.svg_bytes())

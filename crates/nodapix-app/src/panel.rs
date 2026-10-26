@@ -53,6 +53,7 @@ pub enum ToolGroup {
     HueSaturation,
     Sharpen,
     Vignette,
+    Straighten,
 }
 
 #[derive(Clone, Copy)]

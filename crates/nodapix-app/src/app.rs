@@ -1257,6 +1257,10 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.crop_mode || self.active_tool_group.is_none() {
+            return;
+        }
+
         let px_pos = f32::from(event.position.x);
         let py_pos = f32::from(event.position.y);
 
@@ -1296,6 +1300,10 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.crop_mode || self.active_tool_group.is_none() {
+            return;
+        }
+
         let mut update = None;
         if let Some(id) = self.slider_state.active_slider {
             if let Some(spec) = ALL_SPECS.iter().find(|s| s.id == id) {
@@ -1325,8 +1333,13 @@ impl Editor {
     // ---------------------------------------------------------------------- view
 
     fn render_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // Clear slider bounds so only currently painted sliders can be hit-tested
+        self.slider_state.bounds.borrow_mut().clear();
+
         if self.crop_mode {
             self.render_crop_sidebar(cx)
+        } else if let Some(group) = self.active_tool_group {
+            self.render_tool_sidebar(group, cx)
         } else {
             self.render_tools_grid_panel(cx)
         }
@@ -1895,23 +1908,9 @@ impl Editor {
     }
 
     fn render_tools_grid_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let Some(document) = &self.document else {
+        let Some(_document) = &self.document else {
             return div();
         };
-
-        let state = &document.state;
-        let bounds = self.slider_state.bounds.clone();
-        let current_filter = state.color.filter_preset;
-        let active_group = self.active_tool_group;
-
-        let filter_presets = [
-            FilterPreset::None,
-            FilterPreset::BlackAndWhite,
-            FilterPreset::Sepia,
-            FilterPreset::WarmGold,
-            FilterPreset::CoolNordic,
-            FilterPreset::Vivid,
-        ];
 
         div()
             .w(px(PANEL_WIDTH))
@@ -2058,27 +2057,27 @@ impl Editor {
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Sun,
                                                 "Light",
-                                                active_group == Some(ToolGroup::BrightnessContrast),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::BrightnessContrast) { None } else { Some(ToolGroup::BrightnessContrast) };
+                                                    this.active_tool_group = Some(ToolGroup::BrightnessContrast);
                                                     cx.notify();
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Palette,
                                                 "Balance",
-                                                active_group == Some(ToolGroup::ColorBalance),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::ColorBalance) { None } else { Some(ToolGroup::ColorBalance) };
+                                                    this.active_tool_group = Some(ToolGroup::ColorBalance);
                                                     cx.notify();
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Sliders,
                                                 "Levels",
-                                                active_group == Some(ToolGroup::Levels),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Levels) { None } else { Some(ToolGroup::Levels) };
+                                                    this.active_tool_group = Some(ToolGroup::Levels);
                                                     cx.notify();
                                                 }),
                                             ))
@@ -2099,9 +2098,9 @@ impl Editor {
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Activity,
                                                 "Hue/Sat",
-                                                active_group == Some(ToolGroup::HueSaturation),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::HueSaturation) { None } else { Some(ToolGroup::HueSaturation) };
+                                                    this.active_tool_group = Some(ToolGroup::HueSaturation);
                                                     cx.notify();
                                                 }),
                                             ))
@@ -2116,154 +2115,23 @@ impl Editor {
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Zap,
                                                 "Sharpen",
-                                                active_group == Some(ToolGroup::Sharpen),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Sharpen) { None } else { Some(ToolGroup::Sharpen) };
+                                                    this.active_tool_group = Some(ToolGroup::Sharpen);
                                                     cx.notify();
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
                                                 LucideIcon::Eye,
                                                 "Vignette",
-                                                active_group == Some(ToolGroup::Vignette),
+                                                false,
                                                 cx.listener(|this, _, _, cx| {
-                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Vignette) { None } else { Some(ToolGroup::Vignette) };
+                                                    this.active_tool_group = Some(ToolGroup::Vignette);
                                                     cx.notify();
                                                 }),
                                             )),
                                     ),
-                            )
-                            // Contextual slider decks
-                            .when(active_group == Some(ToolGroup::BrightnessContrast), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .pt_1()
-                                        .child(render_slider_row(
-                                            SliderSpec::BRIGHTNESS,
-                                            SliderSpec::BRIGHTNESS.get_value(state),
-                                            bounds.clone(),
-                                        ))
-                                        .child(render_slider_row(
-                                            SliderSpec::CONTRAST,
-                                            SliderSpec::CONTRAST.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            })
-                            .when(active_group == Some(ToolGroup::ColorBalance), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .pt_1()
-                                        .child(render_slider_row(
-                                            SliderSpec::TEMPERATURE,
-                                            SliderSpec::TEMPERATURE.get_value(state),
-                                            bounds.clone(),
-                                        ))
-                                        .child(render_slider_row(
-                                            SliderSpec::TINT,
-                                            SliderSpec::TINT.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            })
-                            .when(active_group == Some(ToolGroup::Levels), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .pt_1()
-                                        .child(render_slider_row(
-                                            SliderSpec::EXPOSURE,
-                                            SliderSpec::EXPOSURE.get_value(state),
-                                            bounds.clone(),
-                                        ))
-                                        .child(render_slider_row(
-                                            SliderSpec::HIGHLIGHTS,
-                                            SliderSpec::HIGHLIGHTS.get_value(state),
-                                            bounds.clone(),
-                                        ))
-                                        .child(render_slider_row(
-                                            SliderSpec::SHADOWS,
-                                            SliderSpec::SHADOWS.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            })
-                            .when(active_group == Some(ToolGroup::HueSaturation), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .pt_1()
-                                        .child(render_slider_row(
-                                            SliderSpec::SATURATION,
-                                            SliderSpec::SATURATION.get_value(state),
-                                            bounds.clone(),
-                                        ))
-                                        .child(render_slider_row(
-                                            SliderSpec::HUE,
-                                            SliderSpec::HUE.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            })
-                            .when(active_group == Some(ToolGroup::Sharpen), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .pt_1()
-                                        .child(render_slider_row(
-                                            SliderSpec::SHARPNESS,
-                                            SliderSpec::SHARPNESS.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            })
-                            .when(active_group == Some(ToolGroup::Vignette), |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .pt_1()
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_wrap()
-                                                .gap_1()
-                                                .children(filter_presets.iter().map(|&preset| {
-                                                    let is_sel = preset == current_filter;
-                                                    div()
-                                                        .px_2()
-                                                        .py(px(2.0))
-                                                        .text_xs()
-                                                        .rounded_sm()
-                                                        .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
-                                                        .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                            this.edit(cx, |state| state.color.filter_preset = preset);
-                                                        }))
-                                                        .child(preset.label())
-                                                })),
-                                        )
-                                        .child(render_slider_row(
-                                            SliderSpec::VIGNETTE,
-                                            SliderSpec::VIGNETTE.get_value(state),
-                                            bounds.clone(),
-                                        )),
-                                )
-                            }),
+                            ),
                     )
                     // Section: Rotation (4x1 Grid + Straighten)
                     .child(
@@ -2320,11 +2188,31 @@ impl Editor {
                                         }),
                                     )),
                             )
-                            .child(render_slider_row(
-                                SliderSpec::ANGLE,
-                                SliderSpec::ANGLE.get_value(state),
-                                bounds.clone(),
-                            )),
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(32.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a_2a_33))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.active_tool_group = Some(ToolGroup::Straighten);
+                                        cx.notify();
+                                    }))
+                                    .child(LucideIcon::SlidersHorizontal.element(14.0, rgb(TEXT_PRIMARY)))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Straighten…"),
+                                    ),
+                            ),
                     )
                     // Section: Format (Resize & Crop)
                     .child(
@@ -2389,6 +2277,370 @@ impl Editor {
                                             .child(div().text_xs().text_color(if self.crop_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }).child("Crop")),
                                     ),
                             ),
+                    ),
+            )
+    }
+
+    fn render_tool_sidebar(&self, group: ToolGroup, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(document) = &self.document else {
+            return div();
+        };
+
+        let state = &document.state;
+        let bounds = self.slider_state.bounds.clone();
+        let current_filter = state.color.filter_preset;
+
+        let filter_presets = [
+            FilterPreset::None,
+            FilterPreset::BlackAndWhite,
+            FilterPreset::Sepia,
+            FilterPreset::WarmGold,
+            FilterPreset::CoolNordic,
+            FilterPreset::Vivid,
+        ];
+
+        let (title, icon, has_histogram) = match group {
+            ToolGroup::BrightnessContrast => ("Light & Contrast", LucideIcon::Sun, true),
+            ToolGroup::ColorBalance => ("Color Balance", LucideIcon::Palette, true),
+            ToolGroup::Levels => ("Levels & Exposure", LucideIcon::Sliders, true),
+            ToolGroup::HueSaturation => ("Hue & Saturation", LucideIcon::Activity, false),
+            ToolGroup::Sharpen => ("Sharpen", LucideIcon::Zap, false),
+            ToolGroup::Vignette => ("Vignette & Filters", LucideIcon::Eye, false),
+            ToolGroup::Straighten => ("Straighten & Rotate", LucideIcon::SlidersHorizontal, false),
+        };
+
+        div()
+            .w(px(PANEL_WIDTH))
+            .h_full()
+            .bg(rgb(PANEL_BG))
+            .border_l_1()
+            .border_color(rgb(BORDER_COLOR))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                // Header: Back button, Title, Reset button
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .bg(rgb(CHROME))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.active_tool_group = None;
+                                cx.notify();
+                            }))
+                            .child(LucideIcon::ChevronLeft.element(14.0, rgb(TEXT_PRIMARY)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Back"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(icon.element(14.0, rgb(ACCENT)))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(title),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                match group {
+                                    ToolGroup::BrightnessContrast => this.edit(cx, |state| {
+                                        state.color.brightness = 0.0;
+                                        state.color.contrast = 0.0;
+                                    }),
+                                    ToolGroup::ColorBalance => this.edit(cx, |state| {
+                                        state.color.temperature = 0.0;
+                                        state.color.tint = 0.0;
+                                    }),
+                                    ToolGroup::Levels => this.edit(cx, |state| {
+                                        state.color.exposure = 0.0;
+                                        state.color.highlights = 0.0;
+                                        state.color.shadows = 0.0;
+                                    }),
+                                    ToolGroup::HueSaturation => this.edit(cx, |state| {
+                                        state.color.saturation = 0.0;
+                                        state.color.hue = 0.0;
+                                    }),
+                                    ToolGroup::Sharpen => this.edit(cx, |state| {
+                                        state.sharpness = 0.0;
+                                    }),
+                                    ToolGroup::Vignette => this.edit(cx, |state| {
+                                        state.color.vignette = 0.0;
+                                        state.color.filter_preset = FilterPreset::None;
+                                    }),
+                                    ToolGroup::Straighten => this.edit(cx, |state| {
+                                        state.angle_fine_degrees = 0.0;
+                                    }),
+                                }
+                            }))
+                            .child("Reset"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_3()
+                    .overflow_hidden()
+                    // Optional Live Histogram
+                    .when(has_histogram, |el| {
+                        el.child(render_histogram(self.histogram.as_ref()))
+                    })
+                    // Tool Controls Card
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .when(group == ToolGroup::BrightnessContrast, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::BRIGHTNESS,
+                                    SliderSpec::BRIGHTNESS.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(render_slider_row(
+                                    SliderSpec::CONTRAST,
+                                    SliderSpec::CONTRAST.get_value(state),
+                                    bounds.clone(),
+                                ))
+                            })
+                            .when(group == ToolGroup::ColorBalance, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::TEMPERATURE,
+                                    SliderSpec::TEMPERATURE.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(render_slider_row(
+                                    SliderSpec::TINT,
+                                    SliderSpec::TINT.get_value(state),
+                                    bounds.clone(),
+                                ))
+                            })
+                            .when(group == ToolGroup::Levels, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::EXPOSURE,
+                                    SliderSpec::EXPOSURE.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(render_slider_row(
+                                    SliderSpec::HIGHLIGHTS,
+                                    SliderSpec::HIGHLIGHTS.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(render_slider_row(
+                                    SliderSpec::SHADOWS,
+                                    SliderSpec::SHADOWS.get_value(state),
+                                    bounds.clone(),
+                                ))
+                            })
+                            .when(group == ToolGroup::HueSaturation, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::SATURATION,
+                                    SliderSpec::SATURATION.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(render_slider_row(
+                                    SliderSpec::HUE,
+                                    SliderSpec::HUE.get_value(state),
+                                    bounds.clone(),
+                                ))
+                            })
+                            .when(group == ToolGroup::Sharpen, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::SHARPNESS,
+                                    SliderSpec::SHARPNESS.get_value(state),
+                                    bounds.clone(),
+                                ))
+                            })
+                            .when(group == ToolGroup::Vignette, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child("Preset Filters"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_1()
+                                                .children(filter_presets.iter().map(|&preset| {
+                                                    let is_sel = preset == current_filter;
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                                        .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            this.edit(cx, |state| state.color.filter_preset = preset);
+                                                        }))
+                                                        .child(preset.label())
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .child(render_slider_row(
+                                            SliderSpec::VIGNETTE,
+                                            SliderSpec::VIGNETTE.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(group == ToolGroup::Straighten, |el| {
+                                el.child(render_slider_row(
+                                    SliderSpec::ANGLE,
+                                    SliderSpec::ANGLE.get_value(state),
+                                    bounds.clone(),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py(px(3.0))
+                                                .text_xs()
+                                                .rounded_sm()
+                                                .bg(rgb(0x2a_2a_33))
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                    this.edit(cx, |state| state.angle_fine_degrees = 0.0);
+                                                }))
+                                                .child("Reset Angle (0°)"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child("Rotate & Flip"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .child(self.render_grid_tool_btn(
+                                                    LucideIcon::RotateCcw,
+                                                    "Left 90°",
+                                                    false,
+                                                    cx.listener(|this, _, window, cx| {
+                                                        this.rotate_ccw(&RotateCCW, window, cx);
+                                                    }),
+                                                ))
+                                                .child(self.render_grid_tool_btn(
+                                                    LucideIcon::RotateCw,
+                                                    "Right 90°",
+                                                    false,
+                                                    cx.listener(|this, _, window, cx| {
+                                                        this.rotate_cw(&RotateCW, window, cx);
+                                                    }),
+                                                ))
+                                                .child(self.render_grid_tool_btn(
+                                                    LucideIcon::FlipHorizontal,
+                                                    "Flip H",
+                                                    false,
+                                                    cx.listener(|this, _, window, cx| {
+                                                        this.flip_h(&FlipH, window, cx);
+                                                    }),
+                                                ))
+                                                .child(self.render_grid_tool_btn(
+                                                    LucideIcon::FlipVertical,
+                                                    "Flip V",
+                                                    false,
+                                                    cx.listener(|this, _, window, cx| {
+                                                        this.flip_v(&FlipV, window, cx);
+                                                    }),
+                                                )),
+                                        ),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                // Bottom Done bar
+                div()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .bg(rgb(CHROME))
+                    .child(
+                        div()
+                            .w_full()
+                            .py(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .rounded_md()
+                            .bg(rgb(ACCENT))
+                            .text_color(rgb(0xff_ff_ff))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.active_tool_group = None;
+                                cx.notify();
+                            }))
+                            .child(LucideIcon::Check.element(14.0, rgb(0xff_ff_ff)))
+                            .child("Done"),
                     ),
             )
     }
