@@ -3,17 +3,27 @@
 use crate::edit_state::EditState;
 use crate::history::HistoryStack;
 use crate::pipeline::execute_pipeline;
-use nodapix_imaging::{downsample_to_fit, PixelBuffer};
+use nodapix_imaging::{downsample_to_fit, straightened_size, PixelBuffer};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub const PROXY_MAX_DIMENSION: u32 = 2048;
+
+/// Render a display preview from a detached proxy buffer.
+///
+/// Kept separate from [`ImageDocument::render_preview`] so the app can hand the
+/// proxy and a state snapshot to a worker thread without touching the document.
+pub fn render_proxy_preview(proxy: &PixelBuffer<f32>, state: &EditState) -> PixelBuffer<u8> {
+    execute_pipeline(proxy, state).to_u8_srgb()
+}
 
 #[derive(Clone, Debug)]
 pub struct ImageDocument {
     /// Full-resolution original decoded image in linear f32 RGBA.
     pub source: PixelBuffer<f32>,
     /// Display-resolution proxy image for 60fps slider updates.
-    pub proxy_source: PixelBuffer<f32>,
+    /// Shared so interactive renders can be dispatched off the main thread.
+    pub proxy_source: Arc<PixelBuffer<f32>>,
     /// Active parametric edit state.
     pub state: EditState,
     /// Committed checkpoints for Undo/Redo.
@@ -26,7 +36,7 @@ pub struct ImageDocument {
 
 impl ImageDocument {
     pub fn new(source: PixelBuffer<f32>, file_path: Option<PathBuf>) -> Self {
-        let proxy_source = downsample_to_fit(&source, PROXY_MAX_DIMENSION);
+        let proxy_source = Arc::new(downsample_to_fit(&source, PROXY_MAX_DIMENSION));
         Self {
             source,
             proxy_source,
@@ -39,8 +49,7 @@ impl ImageDocument {
 
     /// Render interactive display preview (using downsampled proxy for speed).
     pub fn render_preview(&self) -> PixelBuffer<u8> {
-        let linear_result = execute_pipeline(&self.proxy_source, &self.state);
-        linear_result.to_u8_srgb()
+        render_proxy_preview(&self.proxy_source, &self.state)
     }
 
     /// Render unedited original display preview for comparison toggle.
@@ -89,7 +98,7 @@ impl ImageDocument {
             .unwrap_or_else(|| "Untitled.png".to_string())
     }
 
-    /// Calculate the resulting output dimensions after current rotation and crop.
+    /// Calculate the resulting output dimensions after rotation, straightening, and crop.
     pub fn output_size(&self) -> (u32, u32) {
         let (mut w, mut h) = (self.source.width, self.source.height);
         if matches!(
@@ -99,6 +108,7 @@ impl ImageDocument {
         ) {
             std::mem::swap(&mut w, &mut h);
         }
+        let (w, h) = straightened_size(w, h, self.state.angle_fine_degrees);
         if let Some(crop) = self.state.crop {
             let (_, _, cw, ch) = crop.to_pixel_coords(w, h);
             (cw, ch)

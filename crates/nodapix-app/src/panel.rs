@@ -6,13 +6,19 @@ use std::rc::Rc;
 
 use gpui::{
     canvas, div, fill, point, px, size, Bounds, CursorStyle, ParentElement, Pixels,
-    Styled, rgb,
+    Styled, rgb, rgba,
 };
 use nodapix_core::EditState;
+use nodapix_imaging::{
+    ImageHistogram, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN, TEMPERATURE_NEUTRAL_KELVIN,
+};
 
 pub const PANEL_WIDTH: f32 = 280.0;
 pub const TRACK_HEIGHT: f32 = 4.0;
 pub const THUMB_RADIUS: f32 = 5.0;
+
+/// Reciprocal colour-temperature unit: mired = 10^6 / Kelvin.
+const MIREDS_PER_KELVIN: f32 = 1_000_000.0;
 
 pub const PANEL_BG: u32 = 0x18_18_1c;
 pub const SECTION_BG: u32 = 0x20_20_25;
@@ -31,9 +37,12 @@ pub enum SliderId {
     Highlights,
     Shadows,
     Saturation,
+    Hue,
     Temperature,
     Tint,
     Sharpness,
+    Angle,
+    Vignette,
 }
 
 #[derive(Clone, Copy)]
@@ -42,7 +51,6 @@ pub struct SliderSpec {
     pub label: &'static str,
     pub min: f32,
     pub max: f32,
-    #[allow(dead_code)]
     pub default: f32,
     pub bipolar: bool,
 }
@@ -96,12 +104,20 @@ impl SliderSpec {
         default: 0.0,
         bipolar: true,
     };
-    pub const TEMPERATURE: Self = Self {
-        id: SliderId::Temperature,
-        label: "Temperature",
+    pub const HUE: Self = Self {
+        id: SliderId::Hue,
+        label: "Hue",
         min: -1.0,
         max: 1.0,
         default: 0.0,
+        bipolar: true,
+    };
+    pub const TEMPERATURE: Self = Self {
+        id: SliderId::Temperature,
+        label: "Temperature",
+        min: TEMPERATURE_MIN_KELVIN,
+        max: TEMPERATURE_MAX_KELVIN,
+        default: TEMPERATURE_NEUTRAL_KELVIN,
         bipolar: true,
     };
     pub const TINT: Self = Self {
@@ -120,6 +136,22 @@ impl SliderSpec {
         default: 0.0,
         bipolar: false,
     };
+    pub const ANGLE: Self = Self {
+        id: SliderId::Angle,
+        label: "Angle",
+        min: -45.0,
+        max: 45.0,
+        default: 0.0,
+        bipolar: true,
+    };
+    pub const VIGNETTE: Self = Self {
+        id: SliderId::Vignette,
+        label: "Vignette",
+        min: -1.0,
+        max: 1.0,
+        default: 0.0,
+        bipolar: true,
+    };
 
     pub fn format_value(&self, val: f32) -> String {
         match self.id {
@@ -133,6 +165,22 @@ impl SliderSpec {
                 }
             }
             SliderId::Sharpness => format!("{:.0}%", val * 100.0),
+            SliderId::Temperature => format!("{:.0}K", val),
+            SliderId::Angle => {
+                if val.abs() < 0.05 {
+                    "0.0°".to_string()
+                } else {
+                    format!("{:+.1}°", val)
+                }
+            }
+            SliderId::Hue => {
+                let degrees = val * 180.0;
+                if degrees.abs() < 0.5 {
+                    "0°".to_string()
+                } else {
+                    format!("{:+.0}°", degrees)
+                }
+            }
             _ => {
                 if val.abs() < 0.01 {
                     "0%".to_string()
@@ -153,9 +201,12 @@ impl SliderSpec {
             SliderId::Highlights => state.color.highlights,
             SliderId::Shadows => state.color.shadows,
             SliderId::Saturation => state.color.saturation,
+            SliderId::Hue => state.color.hue,
             SliderId::Temperature => state.color.temperature,
             SliderId::Tint => state.color.tint,
             SliderId::Sharpness => state.sharpness,
+            SliderId::Angle => state.angle_fine_degrees,
+            SliderId::Vignette => state.color.vignette,
         }
     }
 
@@ -168,17 +219,49 @@ impl SliderSpec {
             SliderId::Highlights => state.color.highlights = val,
             SliderId::Shadows => state.color.shadows = val,
             SliderId::Saturation => state.color.saturation = val,
+            SliderId::Hue => state.color.hue = val,
             SliderId::Temperature => state.color.temperature = val,
             SliderId::Tint => state.color.tint = val,
             SliderId::Sharpness => state.sharpness = val,
+            SliderId::Angle => state.angle_fine_degrees = val,
+            SliderId::Vignette => state.color.vignette = val,
         }
     }
 
+    /// Temperature travels linearly in mireds (10^6/Kelvin) on either side of
+    /// neutral, which is how the eye reads colour temperature, while every other
+    /// control is linear in its own value.
+    fn is_mired_scale(&self) -> bool {
+        self.id == SliderId::Temperature
+    }
+
     pub fn normalized(&self, val: f32) -> f32 {
+        if self.is_mired_scale() {
+            let mired = MIREDS_PER_KELVIN / val.max(1.0);
+            let neutral = MIREDS_PER_KELVIN / self.default;
+            // Left half: coldest endpoint has the most mireds.
+            if mired >= neutral {
+                let coldest = MIREDS_PER_KELVIN / self.min;
+                return (1.0 - (mired - neutral) / (coldest - neutral)) * 0.5;
+            }
+            let warmest = MIREDS_PER_KELVIN / self.max;
+            return 0.5 + (neutral - mired) / (neutral - warmest) * 0.5;
+        }
         ((val - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
     }
 
     pub fn from_normalized(&self, norm: f32) -> f32 {
+        if self.is_mired_scale() {
+            let neutral = MIREDS_PER_KELVIN / self.default;
+            let mired = if norm <= 0.5 {
+                let coldest = MIREDS_PER_KELVIN / self.min;
+                neutral + (1.0 - norm * 2.0) * (coldest - neutral)
+            } else {
+                let warmest = MIREDS_PER_KELVIN / self.max;
+                neutral - (norm * 2.0 - 1.0) * (neutral - warmest)
+            };
+            return (MIREDS_PER_KELVIN / mired).clamp(self.min, self.max);
+        }
         self.min + norm * (self.max - self.min)
     }
 }
@@ -190,9 +273,12 @@ pub const ALL_SPECS: &[SliderSpec] = &[
     SliderSpec::HIGHLIGHTS,
     SliderSpec::SHADOWS,
     SliderSpec::SATURATION,
+    SliderSpec::HUE,
     SliderSpec::TEMPERATURE,
     SliderSpec::TINT,
     SliderSpec::SHARPNESS,
+    SliderSpec::ANGLE,
+    SliderSpec::VIGNETTE,
 ];
 
 pub struct SliderState {
@@ -274,7 +360,7 @@ pub fn render_slider_row(
                         // Active fill
                         let thumb_x = bx + norm * bw;
                         let fill_bounds = if bipolar {
-                            let center_x = bx + bw * 0.5;
+                            let center_x = bx + bw * spec.normalized(spec.default);
                             let (start_x, fill_w) = if thumb_x >= center_x {
                                 (center_x, thumb_x - center_x)
                             } else {
@@ -300,5 +386,129 @@ pub fn render_slider_row(
                         window.paint_quad(fill(thumb_bounds, rgb(THUMB_COLOR)));
                     },
                 )),
+        )
+}
+
+/// Render a 256-bin RGB and Luminance live histogram.
+pub fn render_histogram(hist: Option<&ImageHistogram>) -> gpui::Div {
+    let hist_data = hist.cloned().unwrap_or_default();
+    div()
+        .w_full()
+        .h(px(72.0))
+        .bg(rgb(0x13_13_17))
+        .border_1()
+        .border_color(rgb(BORDER_COLOR))
+        .rounded_md()
+        .relative()
+        .overflow_hidden()
+        .child(
+            canvas(
+                move |_, _, _| {},
+                move |bounds, _, window, _| {
+                    let w = f32::from(bounds.size.width);
+                    let h = f32::from(bounds.size.height);
+                    let ox = f32::from(bounds.origin.x);
+                    let oy = f32::from(bounds.origin.y);
+
+                    // Grid lines (25%, 50%, 75%)
+                    let grid_col = rgba(0xff_ff_ff_12);
+                    for step in [0.25, 0.50, 0.75] {
+                        let gx = ox + w * step;
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(px(gx), px(oy)),
+                                size: size(px(1.0), px(h)),
+                            },
+                            grid_col,
+                        ));
+                    }
+
+                    if hist_data.max_count == 0 {
+                        return;
+                    }
+
+                    let max_c = hist_data.max_count as f32;
+                    let red_col = rgba(0xff_45_3a_55);
+                    let green_col = rgba(0x30_d1_58_55);
+                    let blue_col = rgba(0x0a_84_ff_55);
+                    let luma_col = rgba(0xff_ff_ff_70);
+
+                    // Draw 256 bins
+                    let bar_w = (w / 256.0).max(1.0);
+                    for i in 0..256 {
+                        let bx = ox + (i as f32 / 256.0) * w;
+
+                        // Red
+                        let rh = (hist_data.r[i] as f32 / max_c * h).min(h);
+                        if rh > 0.5 {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(px(bx), px(oy + h - rh)),
+                                    size: size(px(bar_w), px(rh)),
+                                },
+                                red_col,
+                            ));
+                        }
+
+                        // Green
+                        let gh = (hist_data.g[i] as f32 / max_c * h).min(h);
+                        if gh > 0.5 {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(px(bx), px(oy + h - gh)),
+                                    size: size(px(bar_w), px(gh)),
+                                },
+                                green_col,
+                            ));
+                        }
+
+                        // Blue
+                        let bh = (hist_data.b[i] as f32 / max_c * h).min(h);
+                        if bh > 0.5 {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(px(bx), px(oy + h - bh)),
+                                    size: size(px(bar_w), px(bh)),
+                                },
+                                blue_col,
+                            ));
+                        }
+
+                        // Luma top dot
+                        let lh = (hist_data.luma[i] as f32 / max_c * h).min(h);
+                        if lh > 0.5 {
+                            window.paint_quad(fill(
+                                Bounds {
+                                    origin: point(px(bx), px(oy + h - lh)),
+                                    size: size(px(bar_w), px(1.0)),
+                                },
+                                luma_col,
+                            ));
+                        }
+                    }
+
+                    // Shadow clipping indicator (bottom left blue dot)
+                    if hist_data.shadow_clipped {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(px(ox + 4.0), px(oy + h - 8.0)),
+                                size: size(px(5.0), px(5.0)),
+                            },
+                            rgb(0x0a_84_ff),
+                        ));
+                    }
+
+                    // Highlight clipping indicator (bottom right red dot)
+                    if hist_data.highlight_clipped {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: point(px(ox + w - 9.0), px(oy + h - 8.0)),
+                                size: size(px(5.0), px(5.0)),
+                            },
+                            rgb(0xff_45_3a),
+                        ));
+                    }
+                },
+            )
         )
 }

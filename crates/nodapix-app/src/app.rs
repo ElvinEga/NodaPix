@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui::{
@@ -11,22 +12,23 @@ use gpui::{
     PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, SharedString, Size,
     Styled, Window, prelude::*, rgb, rgba,
 };
-use nodapix_core::{EditState, ImageDocument};
+use nodapix_core::{render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
-    resize, CropRect, ExportFormat, ExportOptions, ImageBackend, NativeBackend,
+    calculate_auto_levels, compute_histogram, resize, CropRatioPreset, CropRect, ExportFormat,
+    ExportOptions, FilterPreset, ImageBackend, ImageHistogram, ImageMetadata, NativeBackend,
 };
 
 use crate::actions::{
-    ActualSize, ApplyCrop, CancelCrop, Export, Fit, FlipH, FlipV, Open, Redo, ResetAdjustments,
-    ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop, ToggleSidebar, Undo,
-    ZoomIn, ZoomOut,
+    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Redo,
+    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop,
+    ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
 };
 use crate::panel::{
-    render_slider_row, SliderId, SliderSpec, SliderState, ALL_SPECS, BORDER_COLOR, PANEL_BG,
-    PANEL_WIDTH, SECTION_BG, TEXT_PRIMARY,
+    render_histogram, render_slider_row, SliderId, SliderSpec, SliderState, ALL_SPECS,
+    BORDER_COLOR, PANEL_BG, PANEL_WIDTH, SECTION_BG, TEXT_PRIMARY,
 };
 use crate::render::texture_from_rgba8;
 
@@ -77,14 +79,24 @@ pub struct Editor {
     focus_handle: FocusHandle,
     sidebar_open: bool,
     slider_state: SliderState,
+    render_generation: Arc<AtomicU64>,
+
+    // Histogram
+    histogram: Option<ImageHistogram>,
 
     // Crop state
     crop_mode: bool,
     draft_crop: Option<CropRect>,
+    crop_preset: CropRatioPreset,
+    crop_portrait: bool,
     crop_drag: Option<CropDrag>,
 
     // Export sheet state
     export_settings: ExportSettings,
+
+    // EXIF metadata inspector
+    metadata: Option<ImageMetadata>,
+    exif_open: bool,
 }
 
 impl Editor {
@@ -104,10 +116,16 @@ impl Editor {
             focus_handle: cx.focus_handle(),
             sidebar_open: true,
             slider_state: SliderState::new(),
+            render_generation: Arc::new(AtomicU64::new(0)),
+            histogram: None,
             crop_mode: false,
             draft_crop: None,
+            crop_preset: CropRatioPreset::Free,
+            crop_portrait: false,
             crop_drag: None,
             export_settings: ExportSettings::default(),
+            metadata: None,
+            exif_open: false,
         }
     }
 
@@ -122,16 +140,21 @@ impl Editor {
     pub fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match NativeBackend::new().decode_from_path(&path) {
             Ok(source) => {
+                self.metadata = ImageMetadata::read_from_path(&path);
                 self.document = Some(ImageDocument::new(source, Some(path.clone())));
                 self.compare = false;
                 self.zoom = Zoom::Fit;
                 self.pan = point(px(0.0), px(0.0));
                 self.crop_mode = false;
                 self.draft_crop = None;
+                self.crop_preset = CropRatioPreset::Free;
+                self.crop_portrait = false;
                 self.crop_drag = None;
                 self.export_settings.is_open = false;
+                self.exif_open = false;
                 self.sync_geometry();
-                self.rebuild_textures();
+                self.rebuild_original_texture();
+                self.request_preview_render(cx);
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -156,55 +179,84 @@ impl Editor {
         }
     }
 
-    /// Re-render the preview textures from the current edit state.
-    fn rebuild_textures(&mut self) {
+    fn rebuild_original_texture(&mut self) {
+        self.original = self
+            .document
+            .as_ref()
+            .map(|document| texture_from_rgba8(&document.render_original_preview()));
+    }
+
+    fn request_preview_render(&mut self, cx: &mut Context<Self>) {
+        let generation = self.render_generation.fetch_add(1, Ordering::SeqCst) + 1;
+
         let Some(document) = &self.document else {
             self.edited = None;
-            self.original = None;
+            self.histogram = None;
             return;
         };
-        self.edited = Some(texture_from_rgba8(&document.render_preview()));
-        self.original = Some(texture_from_rgba8(&document.render_original_preview()));
+        let proxy = document.proxy_source.clone();
+        let state = document.state.clone();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let rendered = executor
+                .spawn(async move { render_proxy_preview(&proxy, &state) })
+                .await;
+
+            let hist = compute_histogram(&rendered);
+
+            let _ = this.update(cx, |editor, cx| {
+                if editor.render_generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                editor.histogram = Some(hist);
+                editor.edited = Some(texture_from_rgba8(&rendered));
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     // ------------------------------------------------------------------ editing
 
-    fn edit(&mut self, change: impl FnOnce(&mut EditState)) {
+    fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut EditState)) {
         let Some(document) = &mut self.document else {
             return;
         };
         document.commit_checkpoint();
         change(&mut document.state);
         self.sync_geometry();
-        self.rebuild_textures();
+        self.request_preview_render(cx);
     }
 
     pub fn rotate_cw(&mut self, _: &RotateCW, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| state.rotate_cw());
+        self.edit(cx, |state| state.rotate_cw());
         cx.notify();
     }
 
     pub fn rotate_ccw(&mut self, _: &RotateCCW, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| state.rotate_ccw());
+        self.edit(cx, |state| state.rotate_ccw());
         cx.notify();
     }
 
     pub fn flip_h(&mut self, _: &FlipH, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| state.toggle_flip_h());
+        self.edit(cx, |state| state.toggle_flip_h());
         cx.notify();
     }
 
     pub fn flip_v(&mut self, _: &FlipV, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| state.toggle_flip_v());
+        self.edit(cx, |state| state.toggle_flip_v());
         cx.notify();
     }
 
     pub fn reset_all(&mut self, _: &ResetAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| state.reset_all());
+        self.edit(cx, |state| state.reset_all());
         self.zoom = Zoom::Fit;
         self.pan = point(px(0.0), px(0.0));
         self.crop_mode = false;
         self.draft_crop = None;
+        self.crop_preset = CropRatioPreset::Free;
+        self.crop_portrait = false;
         cx.notify();
     }
 
@@ -214,7 +266,34 @@ impl Editor {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.edit(|state| state.reset_adjustments());
+        self.edit(cx, |state| state.reset_adjustments());
+        cx.notify();
+    }
+
+    pub fn auto_enhance(&mut self, _: &AutoEnhance, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let preview = document.render_preview();
+        let (exp_ev, contrast) = calculate_auto_levels(&preview);
+        self.edit(cx, |state| {
+            state.color.exposure = exp_ev;
+            state.color.contrast = contrast;
+        });
+        self.status = format!(
+            "Auto Enhance applied: Exposure {:+.1} EV, Contrast {:+.0}%",
+            exp_ev,
+            contrast * 100.0
+        )
+        .into();
+        cx.notify();
+    }
+
+    pub fn toggle_info(&mut self, _: &ToggleInfo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.document.is_none() {
+            return;
+        }
+        self.exif_open = !self.exif_open;
         cx.notify();
     }
 
@@ -256,9 +335,14 @@ impl Editor {
             self.perform_export(cx);
             return;
         }
+        if self.exif_open {
+            self.exif_open = false;
+            cx.notify();
+            return;
+        }
         if self.crop_mode {
             if let Some(crop) = self.draft_crop {
-                self.edit(|state| {
+                self.edit(cx, |state| {
                     state.crop = Some(crop);
                 });
                 self.status = "Crop applied".into();
@@ -276,6 +360,11 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.exif_open {
+            self.exif_open = false;
+            cx.notify();
+            return;
+        }
         if self.crop_mode {
             self.crop_mode = false;
             self.draft_crop = None;
@@ -286,13 +375,39 @@ impl Editor {
     }
 
     pub fn reset_crop(&mut self, _: &ResetCrop, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit(|state| {
+        self.edit(cx, |state| {
             state.crop = None;
         });
         self.crop_mode = false;
         self.draft_crop = None;
         self.crop_drag = None;
+        self.crop_preset = CropRatioPreset::Free;
         self.status = "Crop reset".into();
+        cx.notify();
+    }
+
+    pub fn select_crop_preset(&mut self, preset: CropRatioPreset, cx: &mut Context<Self>) {
+        self.crop_preset = preset;
+        if preset == CropRatioPreset::Free {
+            self.draft_crop = Some(CropRect {
+                x: 0.05,
+                y: 0.05,
+                width: 0.9,
+                height: 0.9,
+            });
+        } else if let Some(ratio) = preset.target_ratio(self.image.width, self.image.height, self.crop_portrait) {
+            self.draft_crop = Some(CropRect::centered_with_ratio(ratio, self.image.width, self.image.height));
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_crop_orientation(&mut self, cx: &mut Context<Self>) {
+        self.crop_portrait = !self.crop_portrait;
+        if self.crop_preset != CropRatioPreset::Free {
+            if let Some(ratio) = self.crop_preset.target_ratio(self.image.width, self.image.height, self.crop_portrait) {
+                self.draft_crop = Some(CropRect::centered_with_ratio(ratio, self.image.width, self.image.height));
+            }
+        }
         cx.notify();
     }
 
@@ -372,7 +487,7 @@ impl Editor {
         if let Some(document) = &mut self.document {
             if document.undo() {
                 self.sync_geometry();
-                self.rebuild_textures();
+                self.request_preview_render(cx);
             }
         }
         cx.notify();
@@ -382,7 +497,7 @@ impl Editor {
         if let Some(document) = &mut self.document {
             if document.redo() {
                 self.sync_geometry();
-                self.rebuild_textures();
+                self.request_preview_render(cx);
             }
         }
         cx.notify();
@@ -522,6 +637,9 @@ impl Editor {
             let dy = (f32::from(event.position.y) - f32::from(drag.start_pos.y)) / img_h;
             let sc = drag.start_crop;
 
+            let ratio_opt = self.crop_preset.target_ratio(img_w, img_h, self.crop_portrait);
+            let r_norm = ratio_opt.map(|r| r * (img_h / img_w));
+
             let updated = match drag.handle {
                 CropHandle::Inside => {
                     let max_x = (1.0 - sc.width).max(0.0);
@@ -533,86 +651,127 @@ impl Editor {
                         height: sc.height,
                     }
                 }
+                CropHandle::BottomRight => {
+                    if let Some(r) = r_norm {
+                        let raw_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
+                        let raw_h = (raw_w / r).clamp(0.05, 1.0 - sc.y);
+                        let final_w = (raw_h * r).clamp(0.05, 1.0 - sc.x);
+                        CropRect { x: sc.x, y: sc.y, width: final_w, height: raw_h }
+                    } else {
+                        let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
+                        let new_h = (sc.height + dy).clamp(0.05, 1.0 - sc.y);
+                        CropRect { x: sc.x, y: sc.y, width: new_w, height: new_h }
+                    }
+                }
                 CropHandle::TopLeft => {
-                    let max_x = sc.x + sc.width - 0.05;
-                    let max_y = sc.y + sc.height - 0.05;
-                    let new_x = (sc.x + dx).clamp(0.0, max_x);
-                    let new_y = (sc.y + dy).clamp(0.0, max_y);
-                    CropRect {
-                        x: new_x,
-                        y: new_y,
-                        width: (sc.x + sc.width) - new_x,
-                        height: (sc.y + sc.height) - new_y,
+                    if let Some(r) = r_norm {
+                        let max_w = sc.x + sc.width;
+                        let max_h = sc.y + sc.height;
+                        let raw_w = (sc.width - dx).clamp(0.05, max_w);
+                        let raw_h = (raw_w / r).clamp(0.05, max_h);
+                        let final_w = (raw_h * r).clamp(0.05, max_w);
+                        let new_x = max_w - final_w;
+                        let new_y = max_h - raw_h;
+                        CropRect { x: new_x, y: new_y, width: final_w, height: raw_h }
+                    } else {
+                        let max_x = sc.x + sc.width - 0.05;
+                        let max_y = sc.y + sc.height - 0.05;
+                        let new_x = (sc.x + dx).clamp(0.0, max_x);
+                        let new_y = (sc.y + dy).clamp(0.0, max_y);
+                        CropRect {
+                            x: new_x,
+                            y: new_y,
+                            width: (sc.x + sc.width) - new_x,
+                            height: (sc.y + sc.height) - new_y,
+                        }
+                    }
+                }
+                CropHandle::TopRight => {
+                    if let Some(r) = r_norm {
+                        let max_h = sc.y + sc.height;
+                        let raw_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
+                        let raw_h = (raw_w / r).clamp(0.05, max_h);
+                        let final_w = (raw_h * r).clamp(0.05, 1.0 - sc.x);
+                        let new_y = max_h - raw_h;
+                        CropRect { x: sc.x, y: new_y, width: final_w, height: raw_h }
+                    } else {
+                        let max_y = sc.y + sc.height - 0.05;
+                        let new_y = (sc.y + dy).clamp(0.0, max_y);
+                        let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
+                        CropRect {
+                            x: sc.x,
+                            y: new_y,
+                            width: new_w,
+                            height: (sc.y + sc.height) - new_y,
+                        }
+                    }
+                }
+                CropHandle::BottomLeft => {
+                    if let Some(r) = r_norm {
+                        let max_w = sc.x + sc.width;
+                        let raw_w = (sc.width - dx).clamp(0.05, max_w);
+                        let raw_h = (raw_w / r).clamp(0.05, 1.0 - sc.y);
+                        let final_w = (raw_h * r).clamp(0.05, max_w);
+                        let new_x = max_w - final_w;
+                        CropRect { x: new_x, y: sc.y, width: final_w, height: raw_h }
+                    } else {
+                        let max_x = sc.x + sc.width - 0.05;
+                        let new_x = (sc.x + dx).clamp(0.0, max_x);
+                        let new_h = (sc.height + dy).clamp(0.05, 1.0 - sc.y);
+                        CropRect {
+                            x: new_x,
+                            y: sc.y,
+                            width: (sc.x + sc.width) - new_x,
+                            height: new_h,
+                        }
                     }
                 }
                 CropHandle::Top => {
                     let max_y = sc.y + sc.height - 0.05;
                     let new_y = (sc.y + dy).clamp(0.0, max_y);
-                    CropRect {
-                        x: sc.x,
-                        y: new_y,
-                        width: sc.width,
-                        height: (sc.y + sc.height) - new_y,
-                    }
-                }
-                CropHandle::TopRight => {
-                    let max_y = sc.y + sc.height - 0.05;
-                    let new_y = (sc.y + dy).clamp(0.0, max_y);
-                    let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
-                    CropRect {
-                        x: sc.x,
-                        y: new_y,
-                        width: new_w,
-                        height: (sc.y + sc.height) - new_y,
-                    }
-                }
-                CropHandle::Right => {
-                    let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
-                    CropRect {
-                        x: sc.x,
-                        y: sc.y,
-                        width: new_w,
-                        height: sc.height,
-                    }
-                }
-                CropHandle::BottomRight => {
-                    let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
-                    let new_h = (sc.height + dy).clamp(0.05, 1.0 - sc.y);
-                    CropRect {
-                        x: sc.x,
-                        y: sc.y,
-                        width: new_w,
-                        height: new_h,
+                    let new_h = (sc.y + sc.height) - new_y;
+                    if let Some(r) = r_norm {
+                        let new_w = (new_h * r).clamp(0.05, 1.0);
+                        let cx = sc.x + sc.width / 2.0;
+                        let new_x = (cx - new_w / 2.0).clamp(0.0, 1.0 - new_w);
+                        CropRect { x: new_x, y: new_y, width: new_w, height: new_h }
+                    } else {
+                        CropRect { x: sc.x, y: new_y, width: sc.width, height: new_h }
                     }
                 }
                 CropHandle::Bottom => {
                     let new_h = (sc.height + dy).clamp(0.05, 1.0 - sc.y);
-                    CropRect {
-                        x: sc.x,
-                        y: sc.y,
-                        width: sc.width,
-                        height: new_h,
-                    }
-                }
-                CropHandle::BottomLeft => {
-                    let max_x = sc.x + sc.width - 0.05;
-                    let new_x = (sc.x + dx).clamp(0.0, max_x);
-                    let new_h = (sc.height + dy).clamp(0.05, 1.0 - sc.y);
-                    CropRect {
-                        x: new_x,
-                        y: sc.y,
-                        width: (sc.x + sc.width) - new_x,
-                        height: new_h,
+                    if let Some(r) = r_norm {
+                        let new_w = (new_h * r).clamp(0.05, 1.0);
+                        let cx = sc.x + sc.width / 2.0;
+                        let new_x = (cx - new_w / 2.0).clamp(0.0, 1.0 - new_w);
+                        CropRect { x: new_x, y: sc.y, width: new_w, height: new_h }
+                    } else {
+                        CropRect { x: sc.x, y: sc.y, width: sc.width, height: new_h }
                     }
                 }
                 CropHandle::Left => {
                     let max_x = sc.x + sc.width - 0.05;
                     let new_x = (sc.x + dx).clamp(0.0, max_x);
-                    CropRect {
-                        x: new_x,
-                        y: sc.y,
-                        width: (sc.x + sc.width) - new_x,
-                        height: sc.height,
+                    let new_w = (sc.x + sc.width) - new_x;
+                    if let Some(r) = r_norm {
+                        let new_h = (new_w / r).clamp(0.05, 1.0);
+                        let cy = sc.y + sc.height / 2.0;
+                        let new_y = (cy - new_h / 2.0).clamp(0.0, 1.0 - new_h);
+                        CropRect { x: new_x, y: new_y, width: new_w, height: new_h }
+                    } else {
+                        CropRect { x: new_x, y: sc.y, width: new_w, height: sc.height }
+                    }
+                }
+                CropHandle::Right => {
+                    let new_w = (sc.width + dx).clamp(0.05, 1.0 - sc.x);
+                    if let Some(r) = r_norm {
+                        let new_h = (new_w / r).clamp(0.05, 1.0);
+                        let cy = sc.y + sc.height / 2.0;
+                        let new_y = (cy - new_h / 2.0).clamp(0.0, 1.0 - new_h);
+                        CropRect { x: sc.x, y: new_y, width: new_w, height: new_h }
+                    } else {
+                        CropRect { x: sc.x, y: sc.y, width: new_w, height: sc.height }
                     }
                 }
             };
@@ -639,13 +798,16 @@ impl Editor {
 
     // ------------------------------------------------------------- slider events
 
-    fn update_slider(&mut self, id: SliderId, val: f32) {
-        if let Some(document) = &mut self.document {
-            if let Some(spec) = ALL_SPECS.iter().find(|s| s.id == id) {
-                spec.set_value(&mut document.state, val);
-                self.rebuild_textures();
-            }
-        }
+    fn update_slider(&mut self, id: SliderId, val: f32, cx: &mut Context<Self>) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        let Some(spec) = ALL_SPECS.iter().find(|s| s.id == id) else {
+            return;
+        };
+        spec.set_value(&mut document.state, val);
+        self.sync_geometry();
+        self.request_preview_render(cx);
     }
 
     fn on_slider_mouse_down(
@@ -682,7 +844,7 @@ impl Editor {
             if let Some(doc) = &mut self.document {
                 doc.commit_checkpoint();
             }
-            self.update_slider(id, val);
+            self.update_slider(id, val, cx);
             cx.notify();
         }
     }
@@ -707,7 +869,7 @@ impl Editor {
             }
         }
         if let Some((id, val)) = update {
-            self.update_slider(id, val);
+            self.update_slider(id, val, cx);
             cx.notify();
         }
     }
@@ -728,6 +890,16 @@ impl Editor {
 
         let state = &document.state;
         let bounds = self.slider_state.bounds.clone();
+        let current_filter = state.color.filter_preset;
+
+        let filter_presets = [
+            FilterPreset::None,
+            FilterPreset::BlackAndWhite,
+            FilterPreset::Sepia,
+            FilterPreset::WarmGold,
+            FilterPreset::CoolNordic,
+            FilterPreset::Vivid,
+        ];
 
         div()
             .w(px(PANEL_WIDTH))
@@ -773,10 +945,12 @@ impl Editor {
                     .flex_1()
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .gap_3()
                     .p_3()
                     .overflow_hidden()
-                    // Section 0: Transform & Crop
+                    // Live Histogram
+                    .child(render_histogram(self.histogram.as_ref()))
+                    // Section 0: Transform & Straighten
                     .child(
                         div()
                             .flex()
@@ -792,7 +966,7 @@ impl Editor {
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Transform & Crop"),
+                                    .child("Transform & Straighten"),
                             )
                             .child(
                                 div()
@@ -843,9 +1017,14 @@ impl Editor {
                                             }))
                                             .child("Flip ⇄"),
                                     ),
-                            ),
+                            )
+                            .child(render_slider_row(
+                                SliderSpec::ANGLE,
+                                SliderSpec::ANGLE.get_value(state),
+                                bounds.clone(),
+                            )),
                     )
-                    // Section 1: Light
+                    // Section 1: Light & Auto
                     .child(
                         div()
                             .flex()
@@ -858,10 +1037,30 @@ impl Editor {
                             .border_color(rgb(BORDER_COLOR))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Light"),
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Light"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(rgb(0x2d_2d_38))
+                                            .text_color(rgb(ACCENT))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.auto_enhance(&AutoEnhance, window, cx);
+                                            }))
+                                            .child("Auto Enhance"),
+                                    ),
                             )
                             .child(render_slider_row(
                                 SliderSpec::EXPOSURE,
@@ -889,7 +1088,7 @@ impl Editor {
                                 bounds.clone(),
                             )),
                     )
-                    // Section 2: Color
+                    // Section 2: Color & Film Presets
                     .child(
                         div()
                             .flex()
@@ -905,11 +1104,38 @@ impl Editor {
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Color"),
+                                    .child("Color & Presets"),
+                            )
+                            // Filter preset pills
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(filter_presets.iter().map(|&preset| {
+                                        let is_sel = preset == current_filter;
+                                        div()
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                            .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                this.edit(cx, |state| state.color.filter_preset = preset);
+                                            }))
+                                            .child(preset.label())
+                                    })),
                             )
                             .child(render_slider_row(
                                 SliderSpec::SATURATION,
                                 SliderSpec::SATURATION.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::HUE,
+                                SliderSpec::HUE.get_value(state),
                                 bounds.clone(),
                             ))
                             .child(render_slider_row(
@@ -920,6 +1146,11 @@ impl Editor {
                             .child(render_slider_row(
                                 SliderSpec::TINT,
                                 SliderSpec::TINT.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::VIGNETTE,
+                                SliderSpec::VIGNETTE.get_value(state),
                                 bounds.clone(),
                             )),
                     )
@@ -946,6 +1177,169 @@ impl Editor {
                                 SliderSpec::SHARPNESS.get_value(state),
                                 bounds.clone(),
                             )),
+                    ),
+            )
+    }
+
+    fn render_exif_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let meta = self.metadata.clone().unwrap_or_default();
+        let (w, h) = self.document.as_ref().map(|d| d.output_size()).unwrap_or((1, 1));
+        let file_name = self.document.as_ref().map(|d| d.file_name()).unwrap_or_default();
+
+        let camera_str = match (&meta.make, &meta.model) {
+            (Some(make), Some(model)) => {
+                if model.starts_with(make) {
+                    model.clone()
+                } else {
+                    format!("{} {}", make, model)
+                }
+            }
+            (None, Some(model)) => model.clone(),
+            (Some(make), None) => make.clone(),
+            (None, None) => "Unknown Camera".to_string(),
+        };
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_aa))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(460.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("File Info & EXIF"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(file_name),
+                            ),
+                    )
+                    // Camera & Lens Card
+                    .child(
+                        div()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(0x2c_2c_36))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(camera_str),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(meta.lens.unwrap_or_else(|| "Standard Optical Lens".to_string())),
+                            ),
+                    )
+                    // Exposure Badges
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_32))
+                                    .text_center()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Aperture"))
+                                    .child(div().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(TEXT_PRIMARY)).child(meta.f_number.unwrap_or_else(|| "—".to_string()))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_32))
+                                    .text_center()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Shutter"))
+                                    .child(div().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(TEXT_PRIMARY)).child(meta.exposure_time.unwrap_or_else(|| "—".to_string()))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_32))
+                                    .text_center()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("ISO"))
+                                    .child(div().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(TEXT_PRIMARY)).child(meta.iso.unwrap_or_else(|| "—".to_string()))),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_32))
+                                    .text_center()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Focal"))
+                                    .child(div().text_sm().font_weight(gpui::FontWeight::BOLD).text_color(rgb(TEXT_PRIMARY)).child(meta.focal_length.unwrap_or_else(|| "—".to_string()))),
+                            ),
+                    )
+                    // Geometry & Date
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("Dimensions: {} × {} px", w, h))
+                            .child(meta.date_time.unwrap_or_default()),
+                    )
+                    // Close button
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.exif_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Done"),
+                            ),
                     ),
             )
     }
@@ -1239,6 +1633,15 @@ impl Editor {
                     .flex()
                     .items_center()
                     .gap_3()
+                    .child(
+                        div()
+                            .text_color(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                this.toggle_info(&ToggleInfo, window, cx);
+                            }))
+                            .child("Info (⌘I)"),
+                    )
                     .child(div().text_color(rgb(MUTED)).child(zoom_text))
                     .child(
                         div()
@@ -1303,6 +1706,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::flip_v))
             .on_action(cx.listener(Self::reset_all))
             .on_action(cx.listener(Self::reset_adjustments))
+            .on_action(cx.listener(Self::auto_enhance))
+            .on_action(cx.listener(Self::toggle_info))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_crop))
             .on_action(cx.listener(Self::apply_crop))
@@ -1312,68 +1717,130 @@ impl Render for Editor {
 
         // Floating Crop toolbar when active
         if self.crop_mode {
+            let presets = [
+                CropRatioPreset::Free,
+                CropRatioPreset::Square,
+                CropRatioPreset::Original,
+                CropRatioPreset::Ratio3x2,
+                CropRatioPreset::Ratio4x3,
+                CropRatioPreset::Ratio16x9,
+                CropRatioPreset::Ratio16x10,
+            ];
+            let active_preset = self.crop_preset;
+            let is_portrait = self.crop_portrait;
+
             root = root.child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .flex_col()
+                    .gap_1()
                     .px_4()
                     .py_2()
-                    .bg(rgb(0x28_28_32))
+                    .bg(rgb(0x24_24_2c))
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .justify_between()
                             .child(
                                 div()
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(0xff_d6_0a))
-                                    .child("Crop Mode Active"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(0xff_d6_0a))
+                                            .child("Crop Tool Active"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("· Drag handles to crop. Enter to apply, Esc to cancel."),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("· Drag handles or region to adjust. Press Enter to apply, Esc to cancel."),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py(px(3.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(rgb(0x3a_3a_44))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.cancel_crop(&CancelCrop, window, cx);
+                                            }))
+                                            .child("Cancel"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py(px(3.0))
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .rounded_md()
+                                            .bg(rgb(ACCENT))
+                                            .text_color(rgb(0xff_ff_ff))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.apply_crop(&ApplyCrop, window, cx);
+                                            }))
+                                            .child("Apply Crop"),
+                                    ),
                             ),
                     )
+                    // Aspect ratio presets row
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1()
                             .child(
                                 div()
-                                    .px_3()
-                                    .py(px(4.0))
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .mr_2()
+                                    .child("Aspect Ratio:"),
+                            )
+                            .children(presets.iter().map(|&p| {
+                                let is_sel = p == active_preset;
+                                div()
+                                    .px_2()
+                                    .py(px(2.0))
                                     .text_xs()
                                     .rounded_md()
-                                    .bg(rgb(0x3a_3a_44))
+                                    .bg(if is_sel { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                        this.select_crop_preset(p, cx);
+                                    }))
+                                    .child(p.label())
+                            }))
+                            .child(
+                                div()
+                                    .ml_2()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if is_portrait { rgb(0x4a_4a_58) } else { rgb(0x32_32_3c) })
                                     .text_color(rgb(TEXT_PRIMARY))
                                     .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                        this.cancel_crop(&CancelCrop, window, cx);
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.toggle_crop_orientation(cx);
                                     }))
-                                    .child("Cancel"),
-                            )
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py(px(4.0))
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .rounded_md()
-                                    .bg(rgb(ACCENT))
-                                    .text_color(rgb(0xff_ff_ff))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                        this.apply_crop(&ApplyCrop, window, cx);
-                                    }))
-                                    .child("Apply Crop"),
+                                    .child(if is_portrait { "Orientation: Vertical ↕" } else { "Orientation: Horizontal ↔" }),
                             ),
                     ),
             );
@@ -1417,6 +1884,11 @@ impl Render for Editor {
         // Export Modal overlay if active
         if self.export_settings.is_open {
             root = root.child(self.render_export_modal(cx));
+        }
+
+        // EXIF Metadata Inspector Modal overlay if active
+        if self.exif_open {
+            root = root.child(self.render_exif_modal(cx));
         }
 
         root

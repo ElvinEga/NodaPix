@@ -14,9 +14,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    ActualSize, ApplyCrop, CancelCrop, Export, Fit, FlipH, FlipV, Open, Quit, Redo,
+    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Quit, Redo,
     ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop,
-    ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -47,6 +47,8 @@ fn main() {
             KeyBinding::new("escape", CancelCrop, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-\\", ToggleCompare, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-backspace", ResetAll, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-i", ToggleInfo, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-u", AutoEnhance, Some(KEY_CONTEXT)),
         ]);
 
         cx.set_menus(vec![
@@ -58,6 +60,8 @@ fn main() {
             Menu::new("File").items(vec![
                 MenuItem::action("Open…", Open),
                 MenuItem::action("Export…", Export),
+                MenuItem::separator(),
+                MenuItem::action("File Info…", ToggleInfo),
             ]),
             Menu::new("Edit").items(vec![
                 MenuItem::action("Undo", Undo),
@@ -76,6 +80,8 @@ fn main() {
                 MenuItem::action("Toggle Adjustments Panel", ToggleSidebar),
             ]),
             Menu::new("Image").items(vec![
+                MenuItem::action("Auto Enhance", AutoEnhance),
+                MenuItem::separator(),
                 MenuItem::action("Crop", ToggleCrop),
                 MenuItem::action("Reset Crop", ResetCrop),
                 MenuItem::separator(),

@@ -9,3 +9,4 @@ image.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+kamadak-exif = { workspace = true }

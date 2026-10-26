@@ -20,6 +20,7 @@ serde_json = "1.0"
 thiserror = "2.0"
 crossbeam-channel = "0.5"
 rfd = "0.15"
+kamadak-exif = "0.6"
 # Pinned to the rev verified to build on Apple Silicon.
 gpui = { git = "https://github.com/zed-industries/zed", rev = "08cbb88a152c3751a43e853425a70e9f631a5918" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "08cbb88a152c3751a43e853425a70e9f631a5918", default-features = false }

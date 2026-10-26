@@ -1,6 +1,7 @@
 use nodapix_core::ImageDocument;
 use nodapix_imaging::{
     CropRect, ExportFormat, ExportOptions, ImageBackend, OrthogonalRotation, RustImageBackend,
+    straightened_size,
 };
 use std::path::PathBuf;
 
@@ -40,7 +41,10 @@ fn test_real_image_full_pipeline_roundtrip() {
     doc.state.color.exposure = 0.5;
     doc.state.color.contrast = 0.2;
     doc.state.color.saturation = 0.3;
+    doc.state.color.hue = 0.2;
+    doc.state.color.temperature = 4200.0;
     doc.state.sharpness = 0.4;
+    doc.state.angle_fine_degrees = 5.0;
 
     // Render preview
     let preview = doc.render_preview();
@@ -48,12 +52,18 @@ fn test_real_image_full_pipeline_roundtrip() {
 
     // Render full export
     let exported = doc.render_export();
-    // In rotated 90 space, width is orig_h, height is orig_w
-    // Cropped to 80%
-    let expected_w = (orig_h as f32 * 0.8).round() as u32;
-    let expected_h = (orig_w as f32 * 0.8).round() as u32;
+    // In rotated 90 space, width is orig_h, height is orig_w; straightening
+    // inscribes a crop before the user crop is applied.
+    let (rot_w, rot_h) = straightened_size(orig_h, orig_w, doc.state.angle_fine_degrees);
+    let expected_w = (rot_w as f32 * 0.8).round() as u32;
+    let expected_h = (rot_h as f32 * 0.8).round() as u32;
     assert_eq!(exported.width, expected_w);
     assert_eq!(exported.height, expected_h);
+    assert_eq!(
+        doc.output_size(),
+        (expected_w, expected_h),
+        "output_size disagrees with the rendered export"
+    );
 
     // Encode to PNG and JPEG
     let tmp_dir = std::env::temp_dir();

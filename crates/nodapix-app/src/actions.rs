@@ -26,5 +26,7 @@ actions!(
         ApplyCrop,
         CancelCrop,
         ResetCrop,
+        ToggleInfo,
+        AutoEnhance,
     ]
 );

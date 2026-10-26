@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EditState {
     pub rotation: OrthogonalRotation,
+    /// Fine straighten angle in degrees, -45.0 to +45.0, clockwise.
+    pub angle_fine_degrees: f32,
     pub flip_horizontal: bool,
     pub flip_vertical: bool,
     pub crop: Option<CropRect>,
@@ -17,6 +19,7 @@ impl Default for EditState {
     fn default() -> Self {
         Self {
             rotation: OrthogonalRotation::None,
+            angle_fine_degrees: 0.0,
             flip_horizontal: false,
             flip_vertical: false,
             crop: None,
@@ -29,6 +32,7 @@ impl Default for EditState {
 impl EditState {
     pub fn is_identity(&self) -> bool {
         self.rotation == OrthogonalRotation::None
+            && self.angle_fine_degrees == 0.0
             && !self.flip_horizontal
             && !self.flip_vertical
             && self.crop.is_none()
