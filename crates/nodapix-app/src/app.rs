@@ -1,4 +1,4 @@
-//! The editor view: owns the open document and the viewport interaction state.
+//! The editor view: owns the open document, the viewport interaction state, and the adjustment panel.
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -6,25 +6,30 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    point, px, size, App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
+    div, point, px, size, App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, SharedString, Size,
-    Styled, Window, div, prelude::*, rgb,
+    Styled, Window, prelude::*, rgb,
 };
 use nodapix_core::{EditState, ImageDocument};
-use nodapix_imaging::{ImageBackend, RustImageBackend};
+use nodapix_imaging::{ExportFormat, ExportOptions, ImageBackend, RustImageBackend};
 
 use crate::actions::{
-    ActualSize, Fit, FlipH, FlipV, Open, Redo, ResetAll, RotateCCW, RotateCW, ToggleCompare, Undo,
-    ZoomIn, ZoomOut,
+    ActualSize, Export, Fit, FlipH, FlipV, Open, Redo, ResetAdjustments, ResetAll, RotateCCW,
+    RotateCW, ToggleCompare, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::canvas::{fit_scale, Viewport, Zoom, MAX_SCALE, MIN_SCALE};
+use crate::panel::{
+    render_slider_row, SliderId, SliderSpec, SliderState, ALL_SPECS, BORDER_COLOR, PANEL_BG,
+    PANEL_WIDTH, SECTION_BG, TEXT_PRIMARY,
+};
 use crate::render::texture_from_rgba8;
 
 const BACKDROP: u32 = 0x14_14_16;
 const CHROME: u32 = 0x1f_1f_22;
 const TEXT: u32 = 0xe6_e6_ea;
 const MUTED: u32 = 0x8a_8a_93;
+const ACCENT: u32 = 0x0a_84_ff;
 
 pub const KEY_CONTEXT: &str = "NodaPix";
 
@@ -40,6 +45,8 @@ pub struct Editor {
     status: SharedString,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     focus_handle: FocusHandle,
+    sidebar_open: bool,
+    slider_state: SliderState,
 }
 
 impl Editor {
@@ -56,6 +63,8 @@ impl Editor {
             status: "Open an image to begin".into(),
             bounds: Rc::new(Cell::new(None)),
             focus_handle: cx.focus_handle(),
+            sidebar_open: true,
+            slider_state: SliderState::new(),
         }
     }
 
@@ -82,9 +91,7 @@ impl Editor {
                     .unwrap_or_else(|| path.display().to_string());
                 self.status = format!(
                     "{} · {}×{}",
-                    name,
-                    self.image.width as u32,
-                    self.image.height as u32
+                    name, self.image.width as u32, self.image.height as u32
                 )
                 .into();
             }
@@ -152,6 +159,61 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn reset_adjustments(
+        &mut self,
+        _: &ResetAdjustments,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit(|state| state.reset_adjustments());
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
+    pub fn export(&mut self, _: &Export, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+
+        let default_name = document.file_name();
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Export Image")
+            .set_file_name(&default_name)
+            .add_filter("PNG Image (*.png)", &["png"])
+            .add_filter("JPEG Image (*.jpg, *.jpeg)", &["jpg", "jpeg"])
+            .add_filter("WebP Image (*.webp)", &["webp"])
+            .save_file()
+        {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+            let format = ExportFormat::from_extension(ext).unwrap_or(ExportFormat::Png);
+            let rendered = document.render_export();
+            match RustImageBackend::new().encode_to_path(
+                &rendered,
+                &path,
+                &ExportOptions {
+                    format,
+                    quality: 90,
+                },
+            ) {
+                Ok(()) => {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    self.status = format!("Exported {}", name).into();
+                }
+                Err(e) => {
+                    self.status = format!("Export failed: {}", e).into();
+                }
+            }
+            cx.notify();
+        }
+    }
+
     pub fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(document) = &mut self.document {
             if document.undo() {
@@ -200,8 +262,6 @@ impl Editor {
             return;
         }
 
-        // Keep the image point under `anchor` stationary as the scale changes:
-        // pan' = (p - c) * (1 - k) + pan * k, with k = new / old.
         if let (Some(anchor), Some(bounds)) = (anchor, self.bounds.get()) {
             let k = new / old;
             let origin_x = f32::from(bounds.origin.x);
@@ -295,11 +355,251 @@ impl Editor {
         cx.notify();
     }
 
+    // ------------------------------------------------------------- slider events
+
+    fn update_slider(&mut self, id: SliderId, val: f32) {
+        if let Some(document) = &mut self.document {
+            if let Some(spec) = ALL_SPECS.iter().find(|s| s.id == id) {
+                spec.set_value(&mut document.state, val);
+                self.rebuild_textures();
+            }
+        }
+    }
+
+    fn on_slider_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let px_pos = f32::from(event.position.x);
+        let py_pos = f32::from(event.position.y);
+
+        let mut hit = None;
+        {
+            let bounds_map = self.slider_state.bounds.borrow();
+            for spec in ALL_SPECS {
+                if let Some(bounds) = bounds_map.get(&spec.id) {
+                    let bx = f32::from(bounds.origin.x);
+                    let by = f32::from(bounds.origin.y);
+                    let bw = f32::from(bounds.size.width);
+                    let bh = f32::from(bounds.size.height);
+
+                    if px_pos >= bx && px_pos <= bx + bw && py_pos >= by - 6.0 && py_pos <= by + bh + 6.0 {
+                        let norm = ((px_pos - bx) / bw).clamp(0.0, 1.0);
+                        let val = spec.from_normalized(norm);
+                        hit = Some((spec.id, val));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((id, val)) = hit {
+            self.slider_state.active_slider = Some(id);
+            if let Some(doc) = &mut self.document {
+                doc.commit_checkpoint();
+            }
+            self.update_slider(id, val);
+            cx.notify();
+        }
+    }
+
+    fn on_slider_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut update = None;
+        if let Some(id) = self.slider_state.active_slider {
+            if let Some(spec) = ALL_SPECS.iter().find(|s| s.id == id) {
+                if let Some(bounds) = self.slider_state.bounds.borrow().get(&id).copied() {
+                    let bx = f32::from(bounds.origin.x);
+                    let bw = f32::from(bounds.size.width);
+                    let px_pos = f32::from(event.position.x);
+                    let norm = ((px_pos - bx) / bw).clamp(0.0, 1.0);
+                    let val = spec.from_normalized(norm);
+                    update = Some((id, val));
+                }
+            }
+        }
+        if let Some((id, val)) = update {
+            self.update_slider(id, val);
+            cx.notify();
+        }
+    }
+
+    fn on_slider_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.slider_state.active_slider.is_some() {
+            self.slider_state.active_slider = None;
+            cx.notify();
+        }
+    }
+
     // ---------------------------------------------------------------------- view
+
+    fn render_panel(&self) -> gpui::Div {
+        let Some(document) = &self.document else {
+            return div();
+        };
+
+        let state = &document.state;
+        let bounds = self.slider_state.bounds.clone();
+
+        div()
+            .w(px(PANEL_WIDTH))
+            .h_full()
+            .bg(rgb(PANEL_BG))
+            .border_l_1()
+            .border_color(rgb(BORDER_COLOR))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                // Panel Header
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .bg(rgb(CHROME))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .child("Adjustments"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .child("Reset"),
+                    ),
+            )
+            .child(
+                // Scrollable Controls Body
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_3()
+                    .overflow_hidden()
+                    // Section 1: Light
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Light"),
+                            )
+                            .child(render_slider_row(
+                                SliderSpec::EXPOSURE,
+                                SliderSpec::EXPOSURE.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::BRIGHTNESS,
+                                SliderSpec::BRIGHTNESS.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::CONTRAST,
+                                SliderSpec::CONTRAST.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::HIGHLIGHTS,
+                                SliderSpec::HIGHLIGHTS.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::SHADOWS,
+                                SliderSpec::SHADOWS.get_value(state),
+                                bounds.clone(),
+                            )),
+                    )
+                    // Section 2: Color
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Color"),
+                            )
+                            .child(render_slider_row(
+                                SliderSpec::SATURATION,
+                                SliderSpec::SATURATION.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::TEMPERATURE,
+                                SliderSpec::TEMPERATURE.get_value(state),
+                                bounds.clone(),
+                            ))
+                            .child(render_slider_row(
+                                SliderSpec::TINT,
+                                SliderSpec::TINT.get_value(state),
+                                bounds.clone(),
+                            )),
+                    )
+                    // Section 3: Detail
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Detail"),
+                            )
+                            .child(render_slider_row(
+                                SliderSpec::SHARPNESS,
+                                SliderSpec::SHARPNESS.get_value(state),
+                                bounds.clone(),
+                            )),
+                    ),
+            )
+    }
 
     fn status_bar(&self) -> gpui::Div {
         let zoom_text = format!("{:.0}%", self.scale() * 100.0);
         let mode = if self.compare { "Original" } else { "Edited" };
+        let panel_btn_text = if self.sidebar_open { "Hide Panel" } else { "Show Panel" };
 
         div()
             .flex()
@@ -313,11 +613,23 @@ impl Editor {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_3()
                     .child(div().text_color(rgb(TEXT)).child(self.status.clone()))
                     .child(div().text_color(rgb(MUTED)).child(mode)),
             )
-            .child(div().text_color(rgb(MUTED)).child(zoom_text))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(div().text_color(rgb(MUTED)).child(zoom_text))
+                    .child(
+                        div()
+                            .text_color(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .child(panel_btn_text),
+                    ),
+            )
     }
 }
 
@@ -367,20 +679,42 @@ impl Render for Editor {
             .on_action(cx.listener(Self::flip_h))
             .on_action(cx.listener(Self::flip_v))
             .on_action(cx.listener(Self::reset_all))
-            .child(self.status_bar())
-            .child(
-                div()
+            .on_action(cx.listener(Self::reset_adjustments))
+            .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::export))
+            .child({
+                let mut split = div()
                     .flex_1()
                     .relative()
+                    .flex()
+                    .flex_row()
                     .overflow_hidden()
-                    .cursor(CursorStyle::OpenHand)
-                    .on_scroll(cx.listener(Self::on_scroll))
-                    .on_pinch(cx.listener(Self::on_pinch))
-                    .on_drop(cx.listener(Self::on_drop))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_pan))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_pan))
-                    .on_mouse_move(cx.listener(Self::drag_pan))
-                    .child(viewport.element()),
-            )
+                    .child(
+                        div()
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .cursor(CursorStyle::OpenHand)
+                            .on_scroll(cx.listener(Self::on_scroll))
+                            .on_pinch(cx.listener(Self::on_pinch))
+                            .on_drop(cx.listener(Self::on_drop))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_pan))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::end_pan))
+                            .on_mouse_move(cx.listener(Self::drag_pan))
+                            .child(viewport.element()),
+                    );
+
+                if self.sidebar_open && self.document.is_some() {
+                    split = split.child(
+                        div()
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_slider_mouse_down))
+                            .on_mouse_move(cx.listener(Self::on_slider_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_slider_mouse_up))
+                            .child(self.render_panel()),
+                    );
+                }
+                split
+            })
+            .child(self.status_bar())
     }
 }

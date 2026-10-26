@@ -3,7 +3,10 @@
 mod actions;
 mod app;
 mod canvas;
+mod panel;
 mod render;
+
+use std::path::PathBuf;
 
 use gpui::{
     App, AppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem, SystemMenuType, WindowBounds,
@@ -11,8 +14,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    ActualSize, Fit, FlipH, FlipV, Open, Quit, Redo, ResetAll, RotateCCW, RotateCW, ToggleCompare,
-    Undo, ZoomIn, ZoomOut,
+    ActualSize, Export, Fit, FlipH, FlipV, Open, Quit, Redo, ResetAdjustments, ResetAll, RotateCCW,
+    RotateCW, ToggleCompare, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -36,6 +39,8 @@ fn main() {
             KeyBinding::new("cmd-]", RotateCW, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-h", FlipH, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-v", FlipV, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-e", ToggleSidebar, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-\\", ToggleCompare, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-backspace", ResetAll, Some(KEY_CONTEXT)),
         ]);
@@ -46,11 +51,15 @@ fn main() {
                 MenuItem::separator(),
                 MenuItem::action("Quit NodaPix", Quit),
             ]),
-            Menu::new("File").items(vec![MenuItem::action("Open…", Open)]),
+            Menu::new("File").items(vec![
+                MenuItem::action("Open…", Open),
+                MenuItem::action("Export…", Export),
+            ]),
             Menu::new("Edit").items(vec![
                 MenuItem::action("Undo", Undo),
                 MenuItem::action("Redo", Redo),
                 MenuItem::separator(),
+                MenuItem::action("Reset Adjustments", ResetAdjustments),
                 MenuItem::action("Reset All", ResetAll),
             ]),
             Menu::new("View").items(vec![
@@ -60,6 +69,7 @@ fn main() {
                 MenuItem::action("Actual Size", ActualSize),
                 MenuItem::separator(),
                 MenuItem::action("Show Original", ToggleCompare),
+                MenuItem::action("Toggle Adjustments Panel", ToggleSidebar),
             ]),
             Menu::new("Image").items(vec![
                 MenuItem::action("Rotate Left", RotateCCW),
@@ -84,6 +94,10 @@ fn main() {
             },
         )
         .expect("failed to open the editor window");
+
+        if let Some(path) = std::env::args().nth(1) {
+            editor.update(cx, |editor, cx| editor.load(PathBuf::from(path), cx));
+        }
 
         cx.activate(true);
     });

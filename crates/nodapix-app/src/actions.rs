@@ -20,5 +20,7 @@ actions!(
         FlipH,
         FlipV,
         ResetAll,
+        ResetAdjustments,
+        ToggleSidebar,
     ]
 );
