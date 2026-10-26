@@ -409,6 +409,43 @@ impl Default for DuplicateFinderSettings {
     }
 }
 
+// ---------------------------------------------------------------- Contact Sheet Modal
+
+#[derive(Clone, Debug)]
+pub struct ContactSheetSettings {
+    pub is_open: bool,
+    pub cols: usize,
+    pub rows: usize,
+    pub preset: nodapix_imaging::SheetPreset,
+    pub background: nodapix_imaging::SheetBackground,
+    pub show_filenames: bool,
+    pub title: String,
+    pub output_dir: Option<PathBuf>,
+    pub base_name: String,
+    pub format: ExportFormat,
+    pub is_generating: bool,
+    pub status_message: String,
+}
+
+impl Default for ContactSheetSettings {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            cols: 4,
+            rows: 4,
+            preset: nodapix_imaging::SheetPreset::Standard4x3,
+            background: nodapix_imaging::SheetBackground::White,
+            show_filenames: true,
+            title: "NodaPix Contact Sheet".to_string(),
+            output_dir: None,
+            base_name: "contact_sheet".to_string(),
+            format: ExportFormat::Png,
+            is_generating: false,
+            status_message: String::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

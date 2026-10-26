@@ -40,5 +40,7 @@ actions!(
         ToggleBatchRename,
         ToggleBatchDate,
         ToggleFindDuplicates,
+        ToggleContactSheet,
+        PrintImage,
     ]
 );

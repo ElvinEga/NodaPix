@@ -23,15 +23,23 @@ use nodapix_imaging::{
 
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
-    PrevImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs,
-    ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare, ToggleCrop,
-    ToggleFindDuplicates, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
-    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    PrevImage, PrintImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
+    SaveAs, ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare,
+    ToggleContactSheet, ToggleCrop, ToggleFindDuplicates, ToggleFullscreen, ToggleInfo,
+    ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::batch::{
     adjust_date_string, compute_dhash, evaluate_rename_template, hamming_distance,
-    BatchConvertSettings, BatchDateSettings, BatchRenameSettings, CaseTransform, DateAdjustMode,
-    DuplicateFileItem, DuplicateFinderSettings, DuplicateGroup, DuplicateMatchMode,
+    BatchConvertSettings, BatchDateSettings, BatchRenameSettings, CaseTransform,
+    ContactSheetSettings, DateAdjustMode, DuplicateFileItem, DuplicateFinderSettings,
+    DuplicateGroup, DuplicateMatchMode,
+};
+use crate::print::{
+    calculate_effective_dimensions, launch_macos_print_system, render_print_page, PaperSize,
+    PrintMargin, PrintModalSettings, PrintOrientation, PrintScaleMode,
+};
+use nodapix_imaging::contact_sheet::{
+    generate_and_save_contact_sheets, ContactSheetConfig, SheetBackground, SheetPreset,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropGuide, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
@@ -257,6 +265,8 @@ pub struct Editor {
     batch_rename: BatchRenameSettings,
     batch_date: BatchDateSettings,
     duplicate_finder: DuplicateFinderSettings,
+    contact_sheet: ContactSheetSettings,
+    print_modal: PrintModalSettings,
 
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
@@ -319,6 +329,8 @@ impl Editor {
             batch_rename: BatchRenameSettings::default(),
             batch_date: BatchDateSettings::default(),
             duplicate_finder: DuplicateFinderSettings::default(),
+            contact_sheet: ContactSheetSettings::default(),
+            print_modal: PrintModalSettings::default(),
             window_title: "NodaPix".into(),
         }
     }
@@ -1322,6 +1334,16 @@ impl Editor {
         }
         if self.duplicate_finder.is_open {
             self.duplicate_finder.is_open = false;
+            cx.notify();
+            return;
+        }
+        if self.contact_sheet.is_open {
+            self.contact_sheet.is_open = false;
+            cx.notify();
+            return;
+        }
+        if self.print_modal.is_open {
+            self.print_modal.is_open = false;
             cx.notify();
             return;
         }
@@ -6973,6 +6995,1053 @@ impl Editor {
                     ),
             )
     }
+
+    // ---------------------------------------------------------------- Contact Sheet
+
+    pub fn toggle_contact_sheet(
+        &mut self,
+        _: &ToggleContactSheet,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folder_images.is_empty() {
+            self.status = "No images found in current folder for contact sheet".into();
+            cx.notify();
+            return;
+        }
+        let default_dest = self
+            .document
+            .as_ref()
+            .and_then(|d| d.file_path.as_ref())
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        self.contact_sheet.output_dir = default_dest;
+        self.contact_sheet.status_message = format!(
+            "Ready to compile {} images into contact sheet",
+            self.folder_images.len()
+        );
+        self.contact_sheet.is_open = !self.contact_sheet.is_open;
+        cx.notify();
+    }
+
+    pub fn execute_generate_contact_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.contact_sheet.is_generating || self.folder_images.is_empty() {
+            return;
+        }
+        let dest_dir = match &self.contact_sheet.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.contact_sheet.status_message = "Please select an output directory".into();
+                cx.notify();
+                return;
+            }
+        };
+
+        if !dest_dir.exists() {
+            let _ = std::fs::create_dir_all(&dest_dir);
+        }
+
+        let images = self.folder_images.clone();
+        let (w, h) = self.contact_sheet.preset.dimensions();
+        let config = ContactSheetConfig {
+            cols: self.contact_sheet.cols,
+            rows: self.contact_sheet.rows,
+            width: w,
+            height: h,
+            background: self.contact_sheet.background,
+            show_filenames: self.contact_sheet.show_filenames,
+            title: if self.contact_sheet.title.trim().is_empty() {
+                None
+            } else {
+                Some(self.contact_sheet.title.clone())
+            },
+            margin: 48,
+            spacing: 24,
+            format: self.contact_sheet.format,
+            quality: 90,
+        };
+        let base_name = self.contact_sheet.base_name.clone();
+
+        self.contact_sheet.is_generating = true;
+        self.contact_sheet.status_message = "Rendering thumbnails into contact sheet...".into();
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move {
+                    generate_and_save_contact_sheets(&images, &config, &dest_dir, &base_name)
+                })
+                .await;
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.contact_sheet.is_generating = false;
+                match result {
+                    Ok(paths) => {
+                        editor.contact_sheet.status_message = format!(
+                            "Successfully created {} sheet(s)!",
+                            paths.len()
+                        );
+                        editor.status = format!("Contact sheet saved ({} page(s))", paths.len()).into();
+                    }
+                    Err(e) => {
+                        editor.contact_sheet.status_message = format!("Error: {}", e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_contact_sheet_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let total_images = self.folder_images.len();
+        let cols = self.contact_sheet.cols;
+        let rows = self.contact_sheet.rows;
+        let per_page = cols * rows;
+        let total_pages = if total_images > 0 {
+            (total_images + per_page - 1) / per_page
+        } else {
+            1
+        };
+        let active_preset = self.contact_sheet.preset;
+        let active_bg = self.contact_sheet.background;
+        let (dim_w, dim_h) = active_preset.dimensions();
+        let is_generating = self.contact_sheet.is_generating;
+        let status_msg = &self.contact_sheet.status_message;
+        let show_filenames = self.contact_sheet.show_filenames;
+        let dest_str = self
+            .contact_sheet
+            .output_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Current folder".to_string());
+        let current_fmt = self.contact_sheet.format;
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(580.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        // Header
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Grid.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Contact Sheet Generator"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded_md()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.contact_sheet.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(LucideIcon::X.element(14.0, rgb(MUTED))),
+                            ),
+                    )
+                    // Grid Configuration (Columns & Rows)
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Columns:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .children([2, 3, 4, 5, 6].into_iter().map(|c| {
+                                                let is_active = cols == c;
+                                                div()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .rounded_md()
+                                                    .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        this.contact_sheet.cols = c;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(format!("{c}"))
+                                            }))
+                                    )
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Rows:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .children([2, 3, 4, 5, 6].into_iter().map(|r| {
+                                                let is_active = rows == r;
+                                                div()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .rounded_md()
+                                                    .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        this.contact_sheet.rows = r;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(format!("{r}"))
+                                            }))
+                                    )
+                            )
+                    )
+                    // Preset Sheet Size
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Sheet Resolution:"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .children([
+                                        SheetPreset::Standard4x3,
+                                        SheetPreset::Photo3x2,
+                                        SheetPreset::Square1x1,
+                                        SheetPreset::Wide16x9,
+                                    ].into_iter().map(|preset| {
+                                        let is_active = active_preset == preset;
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .px_2()
+                                            .py(px(4.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                            .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                this.contact_sheet.preset = preset;
+                                                cx.notify();
+                                            }))
+                                            .child(match preset {
+                                                SheetPreset::Standard4x3 => "4:3 (2400×1800)",
+                                                SheetPreset::Photo3x2 => "3:2 (3000×2000)",
+                                                SheetPreset::Square1x1 => "1:1 (2400×2400)",
+                                                SheetPreset::Wide16x9 => "16:9 (1920×1080)",
+                                            })
+                                    }))
+                            )
+                    )
+                    // Background & Filename Caption
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Background Theme:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .children([
+                                                SheetBackground::White,
+                                                SheetBackground::DarkSlate,
+                                                SheetBackground::Black,
+                                            ].into_iter().map(|bg| {
+                                                let is_active = active_bg == bg;
+                                                div()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .py(px(4.0))
+                                                    .text_xs()
+                                                    .rounded_md()
+                                                    .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        this.contact_sheet.background = bg;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(bg.label())
+                                            }))
+                                    )
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Photo Labels:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .py(px(4.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(if show_filenames { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                            .text_color(if show_filenames { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                this.contact_sheet.show_filenames = !this.contact_sheet.show_filenames;
+                                                cx.notify();
+                                            }))
+                                            .child(if show_filenames { "Show Filenames: ON" } else { "Show Filenames: OFF" })
+                                    )
+                            )
+                    )
+                    // Output Format
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Export Format:"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .children([
+                                        ExportFormat::Png,
+                                        ExportFormat::Jpeg,
+                                        ExportFormat::WebP,
+                                        ExportFormat::Tiff,
+                                    ].into_iter().map(|fmt| {
+                                        let is_active = current_fmt == fmt;
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .py(px(4.0))
+                                            .text_xs()
+                                            .rounded_md()
+                                            .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                            .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                this.contact_sheet.format = fmt;
+                                                cx.notify();
+                                            }))
+                                            .child(match fmt {
+                                                ExportFormat::Png => "PNG",
+                                                ExportFormat::Jpeg => "JPEG",
+                                                ExportFormat::WebP => "WebP",
+                                                ExportFormat::Tiff => "TIFF",
+                                            })
+                                    }))
+                            )
+                    )
+                    // Destination Folder
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Destination Folder:"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .px_3()
+                                            .py(px(5.0))
+                                            .rounded_md()
+                                            .bg(rgb(0x18_18_1c))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .overflow_hidden()
+                                            .child(dest_str),
+                                    )
+                                    .child(
+                                        div()
+                                            .px_3()
+                                            .py(px(5.0))
+                                            .rounded_md()
+                                            .bg(rgb(0x32_32_3c))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                                    this.contact_sheet.output_dir = Some(folder);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            .child("Browse…"),
+                                    ),
+                            ),
+                    )
+                    // Status & Summary Badge
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py(px(6.0))
+                            .rounded_md()
+                            .bg(rgb(0x1a_1a_20))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if is_generating { rgb(ACCENT) } else { rgb(MUTED) })
+                                    .child(if is_generating {
+                                        "Rendering contact sheet...".to_string()
+                                    } else if !status_msg.is_empty() {
+                                        status_msg.clone()
+                                    } else {
+                                        format!("{total_images} photos · {per_page} per sheet · {total_pages} page(s) ({dim_w}×{dim_h} px)")
+                                    })
+                            )
+                    )
+                    // Action Buttons Footer
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.contact_sheet.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .rounded_md()
+                                    .bg(if is_generating { rgb(0x44_44_44) } else { rgb(ACCENT) })
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(if is_generating { CursorStyle::Arrow } else { CursorStyle::PointingHand })
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.execute_generate_contact_sheet(cx);
+                                    }))
+                                    .child(LucideIcon::Grid.element(14.0, rgb(0xff_ff_ff)))
+                                    .child(if is_generating { "Generating…" } else { "Generate Contact Sheet" }),
+                            ),
+                    ),
+            )
+    }
+
+    // ---------------------------------------------------------------- Native macOS Print
+
+    pub fn toggle_print_modal(
+        &mut self,
+        _: &PrintImage,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.document.is_none() {
+            self.status = "No image loaded to print".into();
+            cx.notify();
+            return;
+        }
+        self.print_modal.is_open = !self.print_modal.is_open;
+        self.print_modal.status_message = String::new();
+        cx.notify();
+    }
+
+    pub fn execute_print_system(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = &self.document else {
+            return;
+        };
+
+        let buffer_to_print = if self.print_modal.settings.include_edits {
+            doc.render_export()
+        } else {
+            (*doc.source).clone()
+        };
+
+        let settings = self.print_modal.settings.clone();
+        self.print_modal.is_printing = true;
+        self.print_modal.status_message = "Preparing high-res print document...".into();
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let res = executor
+                .spawn(async move {
+                    let page_buf = render_print_page(&buffer_to_print, &settings);
+                    launch_macos_print_system(&page_buf)
+                })
+                .await;
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.print_modal.is_printing = false;
+                match res {
+                    Ok(_) => {
+                        editor.print_modal.status_message =
+                            "Print dialog launched via macOS system".into();
+                        editor.status = "Print job sent to macOS".into();
+                    }
+                    Err(err) => {
+                        editor.print_modal.status_message = format!("Print notice: {}", err);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn export_print_file(&mut self, cx: &mut Context<Self>) {
+        let Some(doc) = &self.document else {
+            return;
+        };
+
+        let buffer_to_print = if self.print_modal.settings.include_edits {
+            doc.render_export()
+        } else {
+            (*doc.source).clone()
+        };
+
+        let settings = self.print_modal.settings.clone();
+        let default_name = doc
+            .file_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| format!("{}_print.png", s.to_string_lossy()))
+            .unwrap_or_else(|| "print_page.png".to_string());
+
+        let save_target = rfd::FileDialog::new()
+            .set_title("Save Printable Page")
+            .set_file_name(&default_name)
+            .add_filter("PNG Image", &["png"])
+            .add_filter("JPEG Image", &["jpg", "jpeg"])
+            .save_file();
+
+        let Some(target_path) = save_target else {
+            return;
+        };
+
+        let ext = target_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
+        let format = if ext == "jpg" || ext == "jpeg" {
+            ExportFormat::Jpeg
+        } else {
+            ExportFormat::Png
+        };
+
+        let executor = cx.background_executor().clone();
+        self.print_modal.status_message = "Exporting printable layout...".into();
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let res = executor
+                .spawn(async move {
+                    let page_buf = render_print_page(&buffer_to_print, &settings);
+                    let backend = NativeBackend::default();
+                    backend.encode_to_path(&page_buf, &target_path, &ExportOptions { format, quality: 100 })
+                })
+                .await;
+
+            let _ = this.update(cx, |editor, cx| {
+                match res {
+                    Ok(_) => {
+                        editor.print_modal.status_message = "Exported print sheet successfully".into();
+                        editor.status = "Print page exported".into();
+                    }
+                    Err(e) => {
+                        editor.print_modal.status_message = format!("Export failed: {}", e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_print_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let active_paper = self.print_modal.settings.paper_size;
+        let active_orient = self.print_modal.settings.orientation;
+        let active_scale = self.print_modal.settings.scale_mode;
+        let active_margin = self.print_modal.settings.margin;
+        let include_edits = self.print_modal.settings.include_edits;
+        let is_printing = self.print_modal.is_printing;
+        let status_msg = &self.print_modal.status_message;
+
+        let (doc_w, doc_h) = self.document.as_ref().map(|d| d.output_size()).unwrap_or((1920, 1080));
+        let (pw, ph) = calculate_effective_dimensions(&self.print_modal.settings, doc_w, doc_h);
+        let is_landscape = pw > ph;
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(640.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        // Header
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Printer.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Native macOS Print Sheet"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded_md()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.print_modal.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child(LucideIcon::X.element(14.0, rgb(MUTED))),
+                            ),
+                    )
+                    // Split Body: Left Print Layout Preview, Right Print Options
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            // Left Preview Canvas (Simulated Paper)
+                            .child(
+                                div()
+                                    .w(px(200.0))
+                                    .h(px(260.0))
+                                    .bg(rgb(0x18_18_1c))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .rounded_lg()
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .justify_center()
+                                    .p_3()
+                                    .child(
+                                        div()
+                                            .w(if is_landscape { px(170.0) } else { px(130.0) })
+                                            .h(if is_landscape { px(130.0) } else { px(170.0) })
+                                            .bg(rgb(0xff_ff_ff))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(0xdd_dd_dd))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .p(match active_margin {
+                                                PrintMargin::None => px(0.0),
+                                                PrintMargin::Small => px(4.0),
+                                                PrintMargin::Normal => px(8.0),
+                                                PrintMargin::Wide => px(14.0),
+                                            })
+                                            .child(
+                                                div()
+                                                    .size_full()
+                                                    .bg(rgb(0x2a_62_b8))
+                                                    .rounded_xs()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        LucideIcon::Images.element(24.0, rgb(0xff_ff_ff))
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .mt_2()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(format!("{pw}×{ph} px · 300 DPI")),
+                                    ),
+                            )
+                            // Right Options
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_3()
+                                    // Paper Size
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(MUTED)).child("Paper Size:"))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_1()
+                                                    .children([
+                                                        PaperSize::Letter,
+                                                        PaperSize::A4,
+                                                        PaperSize::Photo4x6,
+                                                        PaperSize::Photo5x7,
+                                                        PaperSize::Photo8x10,
+                                                    ].into_iter().map(|p| {
+                                                        let is_active = active_paper == p;
+                                                        div()
+                                                            .flex_1()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .py(px(4.0))
+                                                            .text_xs()
+                                                            .rounded_md()
+                                                            .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                            .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                                this.print_modal.settings.paper_size = p;
+                                                                cx.notify();
+                                                            }))
+                                                            .child(match p {
+                                                                PaperSize::Letter => "Letter",
+                                                                PaperSize::A4 => "A4",
+                                                                PaperSize::Photo4x6 => "4×6\"",
+                                                                PaperSize::Photo5x7 => "5×7\"",
+                                                                PaperSize::Photo8x10 => "8×10\"",
+                                                            })
+                                                    }))
+                                            )
+                                    )
+                                    // Orientation
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(MUTED)).child("Orientation:"))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_1()
+                                                    .children([
+                                                        PrintOrientation::Auto,
+                                                        PrintOrientation::Portrait,
+                                                        PrintOrientation::Landscape,
+                                                    ].into_iter().map(|orient| {
+                                                        let is_active = active_orient == orient;
+                                                        div()
+                                                            .flex_1()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .py(px(4.0))
+                                                            .text_xs()
+                                                            .rounded_md()
+                                                            .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                            .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                                this.print_modal.settings.orientation = orient;
+                                                                cx.notify();
+                                                            }))
+                                                            .child(orient.label())
+                                                    }))
+                                            )
+                                    )
+                                    // Scale Mode
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(div().text_xs().text_color(rgb(MUTED)).child("Scaling:"))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .gap_1()
+                                                    .children([
+                                                        PrintScaleMode::FitToPage,
+                                                        PrintScaleMode::FillPage,
+                                                        PrintScaleMode::OriginalSize,
+                                                    ].into_iter().map(|sm| {
+                                                        let is_active = active_scale == sm;
+                                                        div()
+                                                            .flex_1()
+                                                            .flex()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .py(px(4.0))
+                                                            .text_xs()
+                                                            .rounded_md()
+                                                            .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                            .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                                this.print_modal.settings.scale_mode = sm;
+                                                                cx.notify();
+                                                            }))
+                                                            .child(sm.label())
+                                                    }))
+                                            )
+                                    )
+                                    // Margins
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(div().text_xs().text_color(rgb(MUTED)).child("Margins:"))
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .gap_1()
+                                                            .children([
+                                                                PrintMargin::None,
+                                                                PrintMargin::Small,
+                                                                PrintMargin::Normal,
+                                                                PrintMargin::Wide,
+                                                            ].into_iter().map(|m| {
+                                                                let is_active = active_margin == m;
+                                                                div()
+                                                                    .flex_1()
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .justify_center()
+                                                                    .py(px(4.0))
+                                                                    .text_xs()
+                                                                    .rounded_md()
+                                                                    .bg(if is_active { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                                    .cursor(CursorStyle::PointingHand)
+                                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                                        this.print_modal.settings.margin = m;
+                                                                        cx.notify();
+                                                                    }))
+                                                                    .child(match m {
+                                                                        PrintMargin::None => "0\"",
+                                                                        PrintMargin::Small => "¼\"",
+                                                                        PrintMargin::Normal => "½\"",
+                                                                        PrintMargin::Wide => "1\"",
+                                                                    })
+                                                            }))
+                                                    )
+                                            )
+                                    )
+                                    // Include Edits Toggle
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .px_2()
+                                            .py(px(4.0))
+                                            .rounded_md()
+                                            .bg(rgb(0x1a_1a_20))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .child("Print with active color edits & crop")
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .bg(if include_edits { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                                    .text_color(if include_edits { rgb(0xff_ff_ff) } else { rgb(MUTED) })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                        this.print_modal.settings.include_edits = !this.print_modal.settings.include_edits;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(if include_edits { "ON" } else { "OFF" })
+                                            )
+                                    ),
+                            ),
+                    )
+                    // Status notice if any
+                    .child(
+                        if !status_msg.is_empty() || is_printing {
+                            div()
+                                .px_3()
+                                .py(px(4.0))
+                                .rounded_md()
+                                .bg(rgb(0x1a_1a_20))
+                                .text_xs()
+                                .text_color(if is_printing { rgb(ACCENT) } else { rgb(MUTED) })
+                                .child(if is_printing { "Rendering print layout...".to_string() } else { status_msg.clone() })
+                        } else {
+                            div()
+                        }
+                    )
+                    // Footer action buttons
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.print_modal.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_3()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.export_print_file(cx);
+                                    }))
+                                    .child(LucideIcon::Download.element(13.0, rgb(TEXT_PRIMARY)))
+                                    .child("Export Print File…"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .rounded_md()
+                                    .bg(if is_printing { rgb(0x44_44_44) } else { rgb(ACCENT) })
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(if is_printing { CursorStyle::Arrow } else { CursorStyle::PointingHand })
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.execute_print_system(cx);
+                                    }))
+                                    .child(LucideIcon::Printer.element(14.0, rgb(0xff_ff_ff)))
+                                    .child(if is_printing { "Printing…" } else { "Print via macOS…" }),
+                            ),
+                    ),
+            )
+    }
+
 }
 
 impl Focusable for Editor {
@@ -7053,7 +8122,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_batch_convert))
             .on_action(cx.listener(Self::toggle_batch_rename))
             .on_action(cx.listener(Self::toggle_batch_date))
-            .on_action(cx.listener(Self::toggle_find_duplicates));
+            .on_action(cx.listener(Self::toggle_find_duplicates))
+            .on_action(cx.listener(Self::toggle_contact_sheet))
+            .on_action(cx.listener(Self::toggle_print_modal));
 
         // Fullscreen presentation view
         if self.presentation_mode {
@@ -7441,6 +8512,42 @@ impl Render for Editor {
                                     }))
                                     .child(LucideIcon::Wand2.element(13.0, if self.batch_rename.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
                                     .child("Rename…"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if self.contact_sheet.is_open { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.contact_sheet.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_contact_sheet(&ToggleContactSheet, window, cx);
+                                    }))
+                                    .child(LucideIcon::Grid.element(13.0, if self.contact_sheet.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                    .child("Contact Sheet…"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if self.print_modal.is_open { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.print_modal.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_print_modal(&PrintImage, window, cx);
+                                    }))
+                                    .child(LucideIcon::Printer.element(13.0, if self.print_modal.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                    .child("Print…"),
                             ),
                     )
                     // Right: View controls & Tools sidebar toggle
@@ -7910,6 +9017,16 @@ impl Render for Editor {
         // Duplicate Image Finder Modal overlay if active
         if self.duplicate_finder.is_open {
             root = root.child(self.render_duplicate_finder_modal(cx));
+        }
+
+        // Contact Sheet Generator Modal overlay if active
+        if self.contact_sheet.is_open {
+            root = root.child(self.render_contact_sheet_modal(cx));
+        }
+
+        // Native macOS Print Sheet Modal overlay if active
+        if self.print_modal.is_open {
+            root = root.child(self.render_print_modal(cx));
         }
 
         root

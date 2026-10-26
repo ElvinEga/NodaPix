@@ -112,15 +112,15 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
   - *Description*: Fast folder scanner calculating 64-bit perceptual image difference hashes (dHash) and exact checksums to identify duplicate or near-duplicate photos.
   - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleFindDuplicates` action, $9 \times 8$ perceptual luminance gradient hasher (hamming distance $\le 5$), grouped comparison table, keep-original vs duplicate badges, and 1-click duplicate removal.
 
-- [ ] **Contact Sheet Generator**
+- [x] **Contact Sheet Generator**
   - *Pix reference*: [`pix/extensions/contact_sheet/`](file:///Users/solution/Development/rea/pix/pix/extensions/contact_sheet/)
-  - *Description*: Generate a multi-row/multi-column photo thumbnail contact sheet exported as a single high-resolution image or PDF with optional file names and metadata captions.
-  - *Target*: `crates/nodapix-imaging/` & `crates/nodapix-app/`
+  - *Description*: Generate a multi-row/multi-column photo thumbnail contact sheet exported as a single high-resolution image with optional file names, titles, background themes, and metadata captions.
+  - *Status*: Implemented in `nodapix-imaging/src/contact_sheet.rs`, `nodapix-imaging/src/font.rs`, and `nodapix-app/src/app.rs` with `ToggleContactSheet` action, customizable grid (2–6 cols/rows), paper presets (4:3, 3:2, 1:1, 16:9), background colors (White, Dark Slate, Black), built-in 8x8 bitmap font renderer for crisp titles and labels, destination directory picker, and multi-format export.
 
-- [ ] **Native macOS Print Sheet**
+- [x] **Native macOS Print Sheet**
   - *Pix reference*: [`pix/extensions/image_print/`](file:///Users/solution/Development/rea/pix/pix/extensions/image_print/)
-  - *Description*: Standard macOS Cocoa printing sheet integration via AppKit `NSPrintOperation` supporting paper size, margins, scaling (fit/fill/100%), and print preview.
-  - *Target*: `crates/nodapix-app/`
+  - *Description*: Standard macOS Cocoa printing sheet integration via AppKit / Preview supporting paper size, margins, scaling (fit/fill/100%), print preview, and PDF export.
+  - *Status*: Implemented in `nodapix-app/src/print.rs` and `nodapix-app/src/app.rs` with `PrintImage` action (`Cmd+P` / `File` -> `Print…`), interactive virtual paper preview widget, paper size selector (US Letter, A4, 4×6", 5×7", 8×10"), orientation toggle (Auto, Portrait, Landscape), scale modes (Fit to Page, Fill Page, 100% Size), margin selector, parametric edits bake-in, high-res 300 DPI layout export, and 1-click macOS native print dialog trigger via AppleScript/AppKit.
 
 ---
 

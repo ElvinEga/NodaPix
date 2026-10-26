@@ -3,7 +3,9 @@
 pub mod backend;
 pub mod buffer;
 pub mod color;
+pub mod contact_sheet;
 pub mod filter;
+pub mod font;
 pub mod metadata;
 pub mod transform;
 
@@ -22,7 +24,12 @@ pub use color::{
     ImageHistogram, RedEyeFix, ToneCurve, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN,
     TEMPERATURE_NEUTRAL_KELVIN,
 };
+pub use contact_sheet::{
+    generate_and_save_contact_sheets, generate_contact_sheet_page, ContactSheetConfig,
+    SheetBackground, SheetPreset,
+};
 pub use filter::{gaussian_blur, unsharp_mask};
+pub use font::{render_char, render_text, text_dimensions, truncate_to_width, FONT_8X8};
 pub use metadata::{ImageMetadata, attach_exif};
 pub use transform::{
     apply_exif_orientation, crop, downsample_to_fit, flip_horizontal, flip_vertical, resize,

@@ -6,6 +6,7 @@ mod batch;
 mod canvas;
 mod icon;
 mod panel;
+mod print;
 mod render;
 
 use std::path::PathBuf;
@@ -17,10 +18,10 @@ use gpui::{
 
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
-    PrevImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
-    SaveAs, ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare, ToggleCrop,
-    ToggleFindDuplicates, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
-    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    PrevImage, PrintImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW,
+    Save, SaveAs, ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare,
+    ToggleContactSheet, ToggleCrop, ToggleFindDuplicates, ToggleFullscreen, ToggleInfo,
+    ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -37,6 +38,7 @@ fn main() {
             KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-alt-s", SaveAs, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-p", PrintImage, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-+", ZoomIn, Some(KEY_CONTEXT)),
@@ -81,6 +83,8 @@ fn main() {
                 MenuItem::action("Export…", Export),
                 MenuItem::separator(),
                 MenuItem::action("File Info…", ToggleInfo),
+                MenuItem::separator(),
+                MenuItem::action("Print…", PrintImage),
             ]),
             Menu::new("Edit").items(vec![
                 MenuItem::action("Undo", Undo),
@@ -123,6 +127,8 @@ fn main() {
                 MenuItem::action("Batch Adjust Date/Time…", ToggleBatchDate),
                 MenuItem::separator(),
                 MenuItem::action("Find Duplicate Images…", ToggleFindDuplicates),
+                MenuItem::separator(),
+                MenuItem::action("Contact Sheet Generator…", ToggleContactSheet),
             ]),
         ]);
 
