@@ -45,6 +45,16 @@ pub enum SliderId {
     Vignette,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolGroup {
+    BrightnessContrast,
+    ColorBalance,
+    Levels,
+    HueSaturation,
+    Sharpen,
+    Vignette,
+}
+
 #[derive(Clone, Copy)]
 pub struct SliderSpec {
     pub id: SliderId,
@@ -510,5 +520,6 @@ pub fn render_histogram(hist: Option<&ImageHistogram>) -> gpui::Div {
                     }
                 },
             )
+            .size_full(),
         )
 }

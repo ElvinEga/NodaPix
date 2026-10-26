@@ -30,5 +30,9 @@ actions!(
         ResetCrop,
         ToggleInfo,
         AutoEnhance,
+        PrevImage,
+        NextImage,
+        ToggleThumbnailPane,
+        ToggleResize,
     ]
 );

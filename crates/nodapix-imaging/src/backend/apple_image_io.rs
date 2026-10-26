@@ -1,7 +1,7 @@
 //! Apple Image I/O backend for native hardware-accelerated image decoding on macOS.
 //! Supports Apple HEIC/HEIF, camera RAW (Apple ProRAW, DNG, CR2, NEF, ARW), and standard formats.
 
-use crate::backend::{ExportOptions, ImageBackend, ImageError, RustImageBackend};
+use crate::backend::{ExportOptions, ImageBackend, ImageError, RustImageBackend, orient};
 use crate::buffer::PixelBuffer;
 use std::ffi::c_void;
 use std::path::Path;
@@ -184,7 +184,7 @@ impl ImageBackend for AppleImageIOBackend {
                 data: raw_bytes,
             };
 
-            Ok(PixelBuffer::from_u8_srgb(&u8_buffer))
+            Ok(orient(PixelBuffer::from_u8_srgb(&u8_buffer), bytes))
         }
     }
 

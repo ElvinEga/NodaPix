@@ -1,11 +1,25 @@
 //! ImageBackend abstraction and default Rust `image` crate codec.
 
 use crate::buffer::PixelBuffer;
+use crate::metadata::ImageMetadata;
+use crate::transform::apply_exif_orientation;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor};
 use std::path::Path;
 use thiserror::Error;
+
+/// Decoders hand back the stored raster, so rotate it into display orientation.
+pub(crate) fn orient(decoded: PixelBuffer<f32>, bytes: &[u8]) -> PixelBuffer<f32> {
+    let block = match ImageMetadata::read_exif_block(bytes) {
+        Some(block) => block,
+        None => return decoded,
+    };
+    match ImageMetadata::orientation(&block) {
+        1 => decoded,
+        other => apply_exif_orientation(&decoded, other),
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ImageError {
@@ -90,13 +104,20 @@ impl RustImageBackend {
 impl ImageBackend for RustImageBackend {
     fn decode_from_bytes(&self, bytes: &[u8]) -> Result<PixelBuffer<f32>, ImageError> {
         let dyn_img = image::load_from_memory(bytes)?;
-        Ok(PixelBuffer::from_dynamic_image(&dyn_img))
+        Ok(orient(PixelBuffer::from_dynamic_image(&dyn_img), bytes))
     }
 
     fn decode_from_path(&self, path: &Path) -> Result<PixelBuffer<f32>, ImageError> {
         let reader = BufReader::new(File::open(path)?);
         let dyn_img = image::load(reader, image::ImageFormat::from_path(path)?)?;
-        Ok(PixelBuffer::from_dynamic_image(&dyn_img))
+        let decoded = PixelBuffer::from_dynamic_image(&dyn_img);
+        Ok(match ImageMetadata::read_exif_block_from_path(path) {
+            Some(block) => match ImageMetadata::orientation(&block) {
+                1 => decoded,
+                other => apply_exif_orientation(&decoded, other),
+            },
+            None => decoded,
+        })
     }
 
     fn encode_to_bytes(

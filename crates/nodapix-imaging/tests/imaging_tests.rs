@@ -1,9 +1,10 @@
 use nodapix_imaging::{
-    apply_color_adjustments, crop, flip_horizontal, kelvin_to_white_balance_gains, linear_to_srgb,
-    resize, rotate_orthogonal, rotate_straighten_autocrop, slider_to_kelvin, srgb_to_linear,
-    straightened_size, unsharp_mask, ColorAdjustments, ExportFormat, ExportOptions, ImageBackend,
-    OrthogonalRotation, PixelBuffer, RustImageBackend, TEMPERATURE_MAX_KELVIN,
-    TEMPERATURE_MIN_KELVIN, TEMPERATURE_NEUTRAL_KELVIN,
+    apply_color_adjustments, apply_exif_orientation, attach_exif, crop, flip_horizontal,
+    kelvin_to_white_balance_gains, linear_to_srgb, resize, rotate_orthogonal,
+    rotate_straighten_autocrop, slider_to_kelvin, srgb_to_linear, straightened_size, unsharp_mask,
+    ColorAdjustments, ExportFormat, ExportOptions, ImageBackend, ImageMetadata, OrthogonalRotation,
+    PixelBuffer, RustImageBackend, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN,
+    TEMPERATURE_NEUTRAL_KELVIN,
 };
 
 #[test]
@@ -460,4 +461,154 @@ fn test_image_metadata_inspection() {
     // Test default metadata is empty
     let empty = ImageMetadata::default();
     assert!(empty.is_empty());
+}
+
+/// A hand-built EXIF block: `Exif\0\0` + a little-endian TIFF with a Make string at
+/// offset 38 and the orientation tag we want to exercise.
+fn exif_block(orientation: u16) -> Vec<u8> {
+    let mut tiff: Vec<u8> = Vec::new();
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&8u32.to_le_bytes());
+    tiff.extend_from_slice(&2u16.to_le_bytes());
+    tiff.extend_from_slice(&0x010Fu16.to_le_bytes());
+    tiff.extend_from_slice(&2u16.to_le_bytes());
+    tiff.extend_from_slice(&6u32.to_le_bytes());
+    tiff.extend_from_slice(&38u32.to_le_bytes());
+    tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+    tiff.extend_from_slice(&3u16.to_le_bytes());
+    tiff.extend_from_slice(&1u32.to_le_bytes());
+    tiff.extend_from_slice(&orientation.to_le_bytes());
+    tiff.extend_from_slice(&[0, 0]);
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    tiff.extend_from_slice(b"NIKON\0");
+    assert_eq!(tiff.len(), 44);
+
+    let mut block = b"Exif\0\0".to_vec();
+    block.extend_from_slice(&tiff);
+    block
+}
+
+fn gradient(width: u32, height: u32) -> PixelBuffer<f32> {
+    let mut buf = PixelBuffer::<f32>::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            buf.set_pixel(x, y, [1.0, 0.0, 0.0, 1.0]);
+        }
+    }
+    buf
+}
+
+#[test]
+fn test_exif_block_survives_jpeg_export() {
+    let backend = RustImageBackend::new();
+    let opts = ExportOptions {
+        format: ExportFormat::Jpeg,
+        quality: 90,
+    };
+    let encoded = backend
+        .encode_to_bytes(&gradient(20, 10), &opts)
+        .expect("Encode JPEG");
+    let block = exif_block(1);
+
+    let spliced = attach_exif(&encoded, ExportFormat::Jpeg, &block);
+    assert_eq!(
+        ImageMetadata::read_exif_block(&spliced).as_deref(),
+        Some(block.as_slice()),
+        "the APP1 block must come back byte for byte"
+    );
+
+    let path = std::env::temp_dir().join(format!("nodapix-exif-{}.jpg", std::process::id()));
+    std::fs::write(&path, &spliced).unwrap();
+    let read = ImageMetadata::read_from_path(&path).expect("kamadak-exif must parse the spliced file");
+    assert_eq!(read.make.as_deref(), Some("NIKON"));
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn test_exif_block_survives_png_export() {
+    let backend = RustImageBackend::new();
+    let opts = ExportOptions {
+        format: ExportFormat::Png,
+        quality: 100,
+    };
+    let encoded = backend
+        .encode_to_bytes(&gradient(20, 10), &opts)
+        .expect("Encode PNG");
+    let block = exif_block(1);
+
+    let spliced = attach_exif(&encoded, ExportFormat::Png, &block);
+    assert_eq!(
+        ImageMetadata::read_exif_block(&spliced).as_deref(),
+        Some(block.as_slice())
+    );
+    // Decoding validates every chunk CRC, so this proves the eXIf chunk is well formed.
+    let decoded = backend.decode_from_bytes(&spliced).expect("Decode PNG with eXIf");
+    assert_eq!((decoded.width, decoded.height), (20, 10));
+}
+
+#[test]
+fn test_orientation_tag_is_rewritten_in_place() {
+    let mut block = exif_block(6);
+    assert_eq!(ImageMetadata::orientation(&block), 6);
+    ImageMetadata::set_orientation(&mut block, 1);
+    assert_eq!(ImageMetadata::orientation(&block), 1);
+    assert_eq!(block.len(), exif_block(6).len());
+    assert_eq!(&block[6 + 38..6 + 44], b"NIKON\0");
+}
+
+#[test]
+fn test_decode_applies_exif_orientation() {
+    let backend = RustImageBackend::new();
+    let opts = ExportOptions {
+        format: ExportFormat::Png,
+        quality: 100,
+    };
+    let encoded = backend
+        .encode_to_bytes(&gradient(30, 10), &opts)
+        .expect("Encode PNG");
+
+    for (orientation, expected) in [(1_u32, (30, 10)), (6, (10, 30)), (8, (10, 30))] {
+        let with_exif = attach_exif(
+            &encoded,
+            ExportFormat::Png,
+            &exif_block(orientation as u16),
+        );
+        let decoded = backend
+            .decode_from_bytes(&with_exif)
+            .expect("decode oriented PNG");
+        assert_eq!(
+            (decoded.width, decoded.height),
+            expected,
+            "orientation {orientation} should swap the raster"
+        );
+    }
+}
+
+#[test]
+fn test_apply_exif_orientation_matches_the_dihedral_map() {
+    // 3x2 raster whose pixels encode their own coordinates, so any mapping is visible.
+    let mut src = PixelBuffer::<u8>::new(3, 2);
+    for y in 0..2u32 {
+        for x in 0..3u32 {
+            src.set_pixel(x, y, [x as u8 + 1, y as u8 + 1, 0, 255]);
+        }
+    }
+
+    let rotated = apply_exif_orientation(&src, 6);
+    assert_eq!((rotated.width, rotated.height), (2, 3));
+    assert_eq!(rotated.get_pixel(0, 0)[0..2], [1, 2]);
+    assert_eq!(rotated.get_pixel(1, 2)[0..2], [3, 1]);
+
+    let transposed = apply_exif_orientation(&src, 5);
+    assert_eq!((transposed.width, transposed.height), (2, 3));
+    assert_eq!(transposed.get_pixel(0, 0)[0..2], [1, 1]);
+    assert_eq!(transposed.get_pixel(1, 0)[0..2], [1, 2]);
+
+    let flipped = apply_exif_orientation(&src, 2);
+    assert_eq!((flipped.width, flipped.height), (3, 2));
+    assert_eq!(flipped.get_pixel(0, 0)[0..2], [3, 1]);
+
+    let unchanged = apply_exif_orientation(&src, 1);
+    assert_eq!(unchanged.data, src.data);
 }

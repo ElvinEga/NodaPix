@@ -14,9 +14,10 @@ use gpui::{
 };
 
 use crate::actions::{
-    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Quit, Redo,
-    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs, ToggleCompare,
-    ToggleCrop, ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
+    PrevImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
+    SaveAs, ToggleCompare, ToggleCrop, ToggleInfo, ToggleResize, ToggleSidebar,
+    ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -51,6 +52,10 @@ fn main() {
             KeyBinding::new("cmd-backspace", ResetAll, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-i", ToggleInfo, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-u", AutoEnhance, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-r", ToggleResize, Some(KEY_CONTEXT)),
+            KeyBinding::new("f8", ToggleThumbnailPane, Some(KEY_CONTEXT)),
+            KeyBinding::new("left", PrevImage, Some(KEY_CONTEXT)),
+            KeyBinding::new("right", NextImage, Some(KEY_CONTEXT)),
         ]);
 
         cx.set_menus(vec![
@@ -76,6 +81,9 @@ fn main() {
                 MenuItem::action("Reset All", ResetAll),
             ]),
             Menu::new("View").items(vec![
+                MenuItem::action("Previous Image", PrevImage),
+                MenuItem::action("Next Image", NextImage),
+                MenuItem::separator(),
                 MenuItem::action("Zoom In", ZoomIn),
                 MenuItem::action("Zoom Out", ZoomOut),
                 MenuItem::action("Fit to Window", Fit),
@@ -83,12 +91,14 @@ fn main() {
                 MenuItem::separator(),
                 MenuItem::action("Show Original", ToggleCompare),
                 MenuItem::action("Toggle Adjustments Panel", ToggleSidebar),
+                MenuItem::action("Toggle Thumbnail Pane", ToggleThumbnailPane),
             ]),
             Menu::new("Image").items(vec![
                 MenuItem::action("Auto Enhance", AutoEnhance),
                 MenuItem::separator(),
                 MenuItem::action("Crop", ToggleCrop),
                 MenuItem::action("Reset Crop", ResetCrop),
+                MenuItem::action("Resize Images…", ToggleResize),
                 MenuItem::separator(),
                 MenuItem::action("Rotate Left", RotateCCW),
                 MenuItem::action("Rotate Right", RotateCW),

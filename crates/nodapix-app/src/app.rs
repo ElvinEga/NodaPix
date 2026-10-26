@@ -1,33 +1,37 @@
 //! The editor view: owns the open document, the viewport interaction state, and the adjustment panel.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
 use gpui::{
-    div, point, px, size, App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, SharedString, Size,
-    Styled, Window, prelude::*, rgb, rgba,
+    canvas, div, point, px, size, App, Bounds, Context, Corners, CursorStyle, ExternalPaths,
+    FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent,
+    SharedString, Size, Styled, Window, prelude::*, rgb, rgba,
 };
 use nodapix_core::{execute_pipeline, render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
-    calculate_auto_levels, compute_histogram, resize, CropRatioPreset, CropRect, ExportFormat,
-    ExportOptions, FilterPreset, ImageBackend, ImageHistogram, ImageMetadata, NativeBackend,
+    attach_exif, calculate_auto_levels, compute_histogram, resize, CropRatioPreset, CropRect,
+    ExportFormat, ExportOptions, FilterPreset, ImageBackend, ImageHistogram, ImageMetadata,
+    NativeBackend,
 };
 
 use crate::actions::{
-    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Redo,
-    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs, ToggleCompare,
-    ToggleCrop, ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
+    PrevImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs,
+    ToggleCompare, ToggleCrop, ToggleInfo, ToggleResize, ToggleSidebar, ToggleThumbnailPane, Undo,
+    ZoomIn, ZoomOut,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
 };
 use crate::panel::{
-    render_histogram, render_slider_row, SliderId, SliderSpec, SliderState, ALL_SPECS,
-    BORDER_COLOR, PANEL_BG, PANEL_WIDTH, SECTION_BG, TEXT_PRIMARY,
+    render_histogram, render_slider_row, SliderId, SliderSpec, SliderState, ToolGroup, ALL_SPECS,
+    BORDER_COLOR, PANEL_BG, PANEL_WIDTH, SECTION_BG, TEXT_MUTED, TEXT_PRIMARY,
 };
 use crate::render::texture_from_rgba8;
 
@@ -65,6 +69,27 @@ fn write_atomically(bytes: &[u8], path: &Path) -> Result<(), String> {
     result.map_err(|e| format!("{}: {}", path.display(), e))
 }
 
+/// Re-embed the source file's EXIF in freshly encoded bytes. The orientation tag is
+/// normalised because decoding already baked it into the pixels.
+fn with_exif(encoded: Vec<u8>, format: ExportFormat, block: Option<&[u8]>) -> Vec<u8> {
+    let Some(block) = block else {
+        return encoded;
+    };
+    let mut block = block.to_vec();
+    ImageMetadata::set_orientation(&mut block, 1);
+    attach_exif(&encoded, format, &block)
+}
+
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 struct CropDrag {
     handle: CropHandle,
     start_pos: Point<Pixels>,
@@ -85,6 +110,35 @@ impl Default for ExportSettings {
             format: ExportFormat::Jpeg,
             quality: 90,
             scale_percent: 100,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ResizeSettings {
+    pub is_open: bool,
+    pub width: u32,
+    pub height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub unit_percent: bool,
+    pub preserve_aspect_ratio: bool,
+    pub destination_folder: Option<PathBuf>,
+    pub format: Option<ExportFormat>,
+}
+
+impl Default for ResizeSettings {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            width: 1920,
+            height: 1080,
+            original_width: 1920,
+            original_height: 1080,
+            unit_percent: false,
+            preserve_aspect_ratio: true,
+            destination_folder: None,
+            format: None,
         }
     }
 }
@@ -115,13 +169,29 @@ pub struct Editor {
     crop_preset: CropRatioPreset,
     crop_portrait: bool,
     crop_drag: Option<CropDrag>,
+    crop_multiple_of: Option<u32>,
 
     // Export sheet state
     export_settings: ExportSettings,
 
+    // Resize dialog state
+    resize_settings: ResizeSettings,
+
+    // Folder images & carousel
+    folder_images: Vec<PathBuf>,
+    folder_index: usize,
+    thumbnail_cache: HashMap<PathBuf, Arc<RenderImage>>,
+    thumbnail_pane_open: bool,
+    file_size_bytes: u64,
+
+    // Active tool group in right panel grid
+    active_tool_group: Option<ToolGroup>,
+
     // EXIF metadata inspector
     metadata: Option<ImageMetadata>,
     exif_open: bool,
+    /// The source file's own EXIF block, re-embedded into every export.
+    exif_block: Option<Vec<u8>>,
 
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
@@ -151,9 +221,18 @@ impl Editor {
             crop_preset: CropRatioPreset::Free,
             crop_portrait: false,
             crop_drag: None,
+            crop_multiple_of: None,
             export_settings: ExportSettings::default(),
+            resize_settings: ResizeSettings::default(),
+            folder_images: Vec::new(),
+            folder_index: 0,
+            thumbnail_cache: HashMap::new(),
+            thumbnail_pane_open: true,
+            file_size_bytes: 0,
+            active_tool_group: Some(ToolGroup::BrightnessContrast),
             metadata: None,
             exif_open: false,
+            exif_block: None,
             window_title: "NodaPix".into(),
         }
     }
@@ -170,6 +249,7 @@ impl Editor {
         match NativeBackend::new().decode_from_path(&path) {
             Ok(source) => {
                 self.metadata = ImageMetadata::read_from_path(&path);
+                self.exif_block = ImageMetadata::read_exif_block_from_path(&path);
                 self.document = Some(ImageDocument::new(source, Some(path.clone())));
                 self.compare = false;
                 self.zoom = Zoom::Fit;
@@ -185,20 +265,203 @@ impl Editor {
                 self.rebuild_original_texture();
                 self.edited = self.original.clone();
                 self.request_preview_render(cx);
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| path.display().to_string());
-                self.status = format!(
-                    "{} · {}×{}",
-                    name, self.image.width as u32, self.image.height as u32
-                )
-                .into();
+                self.file_size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.scan_folder(&path, cx);
+                self.update_status();
             }
             Err(err) => {
                 self.status = format!("Cannot open {}: {}", path.display(), err).into();
             }
         }
+        cx.notify();
+    }
+
+    fn update_status(&mut self) {
+        let Some(document) = &self.document else {
+            self.status = "Open an image to begin".into();
+            return;
+        };
+        let (w, h) = document.output_size();
+        let idx_str = if !self.folder_images.is_empty() {
+            format!("{}/{} · ", self.folder_index + 1, self.folder_images.len())
+        } else {
+            String::new()
+        };
+        let size_str = if self.file_size_bytes > 0 {
+            format!(" · {}", format_file_size(self.file_size_bytes))
+        } else {
+            String::new()
+        };
+        let zoom_pct = (self.scale() * 100.0).round() as u32;
+        self.status = format!("{}{}×{}{size_str} · {}%", idx_str, w, h, zoom_pct).into();
+    }
+
+    fn scan_folder(&mut self, current_path: &Path, cx: &mut Context<Self>) {
+        let Some(parent) = current_path.parent() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return;
+        };
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                    let ext = ext.to_lowercase();
+                    if matches!(
+                        ext.as_str(),
+                        "jpg" | "jpeg" | "png" | "webp" | "tiff" | "tif" | "bmp" | "heic" | "heif" | "avif" | "dng"
+                    ) {
+                        files.push(p);
+                    }
+                }
+            }
+        }
+        files.sort();
+        self.folder_index = files.iter().position(|p| p == current_path).unwrap_or(0);
+        self.folder_images = files;
+        self.request_thumbnails(cx);
+    }
+
+    fn request_thumbnails(&mut self, cx: &mut Context<Self>) {
+        let images = self.folder_images.clone();
+        let executor = cx.background_executor().clone();
+        for path in images {
+            if self.thumbnail_cache.contains_key(&path) {
+                continue;
+            }
+            let p = path.clone();
+            let p_decode = path.clone();
+            let executor = executor.clone();
+            cx.spawn(async move |this, cx| {
+                let thumb = executor
+                    .spawn(async move {
+                        NativeBackend::new()
+                            .decode_from_path(&p_decode)
+                            .ok()
+                            .map(|buf| {
+                                let small = nodapix_imaging::downsample_to_fit(&buf, 140);
+                                texture_from_rgba8(&small.to_u8_srgb())
+                            })
+                    })
+                    .await;
+                if let Some(texture) = thumb {
+                    let _ = this.update(cx, |editor, cx| {
+                        editor.thumbnail_cache.insert(p, texture);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+    }
+
+    pub fn prev_image(&mut self, _: &PrevImage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.folder_images.is_empty() {
+            return;
+        }
+        if self.folder_index == 0 {
+            self.folder_index = self.folder_images.len() - 1;
+        } else {
+            self.folder_index -= 1;
+        }
+        let next_path = self.folder_images[self.folder_index].clone();
+        self.load(next_path, cx);
+    }
+
+    pub fn next_image(&mut self, _: &NextImage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.folder_images.is_empty() {
+            return;
+        }
+        if self.folder_index + 1 >= self.folder_images.len() {
+            self.folder_index = 0;
+        } else {
+            self.folder_index += 1;
+        }
+        let next_path = self.folder_images[self.folder_index].clone();
+        self.load(next_path, cx);
+    }
+
+    pub fn toggle_thumbnail_pane(
+        &mut self,
+        _: &ToggleThumbnailPane,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.thumbnail_pane_open = !self.thumbnail_pane_open;
+        cx.notify();
+    }
+
+    pub fn toggle_resize(&mut self, _: &ToggleResize, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(doc) = &self.document {
+            let (w, h) = doc.output_size();
+            self.resize_settings.original_width = w;
+            self.resize_settings.original_height = h;
+            self.resize_settings.width = w;
+            self.resize_settings.height = h;
+            self.resize_settings.unit_percent = false;
+            self.resize_settings.destination_folder = doc
+                .file_path
+                .as_ref()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+            self.resize_settings.is_open = !self.resize_settings.is_open;
+            cx.notify();
+        }
+    }
+
+    pub fn execute_resize(&mut self, cx: &mut Context<Self>) {
+        let Some(document) = &mut self.document else {
+            return;
+        };
+        let target_w = if self.resize_settings.unit_percent {
+            ((self.resize_settings.original_width as f64 * self.resize_settings.width as f64
+                / 100.0)
+                .round() as u32)
+                .max(1)
+        } else {
+            self.resize_settings.width.max(1)
+        };
+        let target_h = if self.resize_settings.unit_percent {
+            ((self.resize_settings.original_height as f64 * self.resize_settings.height as f64
+                / 100.0)
+                .round() as u32)
+                .max(1)
+        } else {
+            self.resize_settings.height.max(1)
+        };
+
+        let exported = document.render_export();
+        let resized = nodapix_imaging::resize(&exported, target_w, target_h);
+
+        if let Some(dest_dir) = &self.resize_settings.destination_folder {
+            let orig_name = document.file_name();
+            let base_name = Path::new(&orig_name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "image".to_string());
+            let fmt = self.resize_settings.format.unwrap_or(ExportFormat::Png);
+            let ext = fmt.extension();
+            let out_name = format!("{}_{}x{}.{}", base_name, target_w, target_h, ext);
+            let out_path = dest_dir.join(out_name);
+
+            let options = ExportOptions {
+                format: fmt,
+                quality: 90,
+            };
+            if let Ok(bytes) = NativeBackend::new().encode_to_bytes(&resized, &options) {
+                let final_bytes = with_exif(bytes, fmt, self.exif_block.as_deref());
+                let _ = std::fs::write(&out_path, final_bytes);
+            }
+        }
+
+        self.document = Some(ImageDocument::new(resized, document.file_path.clone()));
+        self.sync_geometry();
+        self.rebuild_original_texture();
+        self.edited = self.original.clone();
+        self.request_preview_render(cx);
+        self.resize_settings.is_open = false;
+        self.update_status();
         cx.notify();
     }
 
@@ -485,14 +748,24 @@ impl Editor {
                 rendered = resize(&rendered, target_w, target_h);
             }
 
-            match NativeBackend::new().encode_to_path(
-                &rendered,
-                &path,
-                &ExportOptions {
-                    format: self.export_settings.format,
-                    quality: self.export_settings.quality,
-                },
-            ) {
+            let encoded = NativeBackend::new()
+                .encode_to_bytes(
+                    &rendered,
+                    &ExportOptions {
+                        format: self.export_settings.format,
+                        quality: self.export_settings.quality,
+                    },
+                )
+                .map_err(|e| e.to_string())
+                .map(|bytes| {
+                    with_exif(
+                        bytes,
+                        self.export_settings.format,
+                        self.exif_block.as_deref(),
+                    )
+                });
+
+            match encoded.and_then(|bytes| write_atomically(&bytes, &path)) {
                 Ok(()) => {
                     let name = path
                         .file_name()
@@ -600,6 +873,7 @@ impl Editor {
         let source = document.source.clone();
         let state = document.state.clone();
         let quality = self.export_settings.quality;
+        let exif = self.exif_block.clone();
         let label = file_label(&path);
 
         self.status = format!("Saving {label}…").into();
@@ -614,6 +888,7 @@ impl Editor {
                     NativeBackend::new()
                         .encode_to_bytes(&rendered, &ExportOptions { format, quality })
                         .map_err(|e| e.to_string())
+                        .map(|bytes| with_exif(bytes, format, exif.as_deref()))
                         .and_then(|bytes| write_atomically(&bytes, &destination))
                         .map(|_| state)
                 })
@@ -1049,21 +1324,39 @@ impl Editor {
     // ---------------------------------------------------------------------- view
 
     fn render_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        if self.crop_mode {
+            self.render_crop_sidebar(cx)
+        } else {
+            self.render_tools_grid_panel(cx)
+        }
+    }
+
+    fn render_crop_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let Some(document) = &self.document else {
             return div();
         };
 
-        let state = &document.state;
-        let bounds = self.slider_state.bounds.clone();
-        let current_filter = state.color.filter_preset;
+        let (img_w, img_h) = document.output_size();
+        let crop = self.draft_crop.unwrap_or(CropRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        });
+        let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
+        let step = self.crop_multiple_of.unwrap_or(1);
+        let current_preset = self.crop_preset;
+        let is_portrait = self.crop_portrait;
+        let multiple_of = self.crop_multiple_of;
 
-        let filter_presets = [
-            FilterPreset::None,
-            FilterPreset::BlackAndWhite,
-            FilterPreset::Sepia,
-            FilterPreset::WarmGold,
-            FilterPreset::CoolNordic,
-            FilterPreset::Vivid,
+        let presets = [
+            CropRatioPreset::Free,
+            CropRatioPreset::Square,
+            CropRatioPreset::Original,
+            CropRatioPreset::Ratio3x2,
+            CropRatioPreset::Ratio4x3,
+            CropRatioPreset::Ratio16x9,
+            CropRatioPreset::Ratio16x10,
         ];
 
         div()
@@ -1091,7 +1384,611 @@ impl Editor {
                             .text_xs()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(TEXT_PRIMARY))
-                            .child("Adjustments"),
+                            .child("Crop"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                this.cancel_crop(&CancelCrop, window, cx);
+                            }))
+                            .child("Cancel"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_3()
+                    .overflow_hidden()
+                    // Selection group
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Selection"),
+                            )
+                            // Width spinbox
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(format!("{} px", crop_w)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_w = crop_w.saturating_sub(step).max(step);
+                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
+                                                        let new_h = if let Some(r) = target_ratio {
+                                                            ((new_w as f32 / r).round() as u32).min(img_h - crop_y)
+                                                        } else {
+                                                            crop_h
+                                                        };
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_w = (crop_w + step).min(img_w - crop_x);
+                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
+                                                        let new_h = if let Some(r) = target_ratio {
+                                                            ((new_w as f32 / r).round() as u32).min(img_h - crop_y)
+                                                        } else {
+                                                            crop_h
+                                                        };
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            ),
+                                    ),
+                            )
+                            // Height spinbox
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Height:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(format!("{} px", crop_h)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_h = crop_h.saturating_sub(step).max(step);
+                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
+                                                        let new_w = if let Some(r) = target_ratio {
+                                                            ((new_h as f32 * r).round() as u32).min(img_w - crop_x)
+                                                        } else {
+                                                            crop_w
+                                                        };
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_h = (crop_h + step).min(img_h - crop_y);
+                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
+                                                        let new_w = if let Some(r) = target_ratio {
+                                                            ((new_h as f32 * r).round() as u32).min(img_w - crop_x)
+                                                        } else {
+                                                            crop_w
+                                                        };
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            ),
+                                    ),
+                            )
+                            // Position X spinbox
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Position X:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(format!("{} px", crop_x)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_x = crop_x.saturating_sub(step);
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(new_x, crop_y, crop_w, crop_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_x = (crop_x + step).min(img_w.saturating_sub(crop_w));
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(new_x, crop_y, crop_w, crop_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            ),
+                                    ),
+                            )
+                            // Position Y spinbox
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Position Y:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(format!("{} px", crop_y)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_y = crop_y.saturating_sub(step);
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, new_y, crop_w, crop_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let new_y = (crop_y + step).min(img_h.saturating_sub(crop_h));
+                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, new_y, crop_w, crop_h, img_w, img_h));
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            ),
+                                    ),
+                            )
+                            // Maximize & Center action buttons
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .pt_1()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .py(px(4.0))
+                                            .text_center()
+                                            .text_xs()
+                                            .rounded_sm()
+                                            .bg(rgb(0x2a_2a_33))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
+                                                if let Some(r) = target_ratio {
+                                                    this.draft_crop = Some(CropRect::centered_with_ratio(r, img_w as f32, img_h as f32));
+                                                } else {
+                                                    this.draft_crop = Some(CropRect { x: 0.0, y: 0.0, width: 1.0, height: 1.0 });
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child("Maximize"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .py(px(4.0))
+                                            .text_center()
+                                            .text_xs()
+                                            .rounded_sm()
+                                            .bg(rgb(0x2a_2a_33))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                let new_x = (img_w.saturating_sub(crop_w)) / 2;
+                                                let new_y = (img_h.saturating_sub(crop_h)) / 2;
+                                                this.draft_crop = Some(CropRect::from_pixel_coords(new_x, new_y, crop_w, crop_h, img_w, img_h));
+                                                cx.notify();
+                                            }))
+                                            .child("Center"),
+                                    ),
+                            ),
+                    )
+                    // Aspect ratio group
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Aspect ratio"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(presets.iter().map(|&preset| {
+                                        let is_sel = preset == current_preset;
+                                        div()
+                                            .px_2()
+                                            .py(px(2.0))
+                                            .text_xs()
+                                            .rounded_sm()
+                                            .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                            .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                this.crop_preset = preset;
+                                                if let Some(ratio) = preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait) {
+                                                    this.draft_crop = Some(CropRect::centered_with_ratio(ratio, img_w as f32, img_h as f32));
+                                                }
+                                                cx.notify();
+                                            }))
+                                            .child(preset.label())
+                                    })),
+                            )
+                            // Invert aspect ratio toggle
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                        this.crop_portrait = !this.crop_portrait;
+                                        if let Some(ratio) = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait) {
+                                            this.draft_crop = Some(CropRect::centered_with_ratio(ratio, img_w as f32, img_h as f32));
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .bg(if is_portrait { rgb(ACCENT) } else { rgb(0x18_18_1c) })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_xs()
+                                            .text_color(rgb(0xff_ff_ff))
+                                            .child(if is_portrait { "✓" } else { "" }),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Invert aspect ratio")),
+                            )
+                            // Multiple of N px toggle
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                this.crop_multiple_of = if this.crop_multiple_of.is_some() { None } else { Some(8) };
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .w(px(14.0))
+                                                    .h(px(14.0))
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .bg(if multiple_of.is_some() { rgb(ACCENT) } else { rgb(0x18_18_1c) })
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_xs()
+                                                    .text_color(rgb(0xff_ff_ff))
+                                                    .child(if multiple_of.is_some() { "✓" } else { "" }),
+                                            )
+                                            .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Multiple of:")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(1.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(format!("{} px", multiple_of.unwrap_or(8))),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    // Apply & Cancel buttons
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .pt_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .py(px(6.0))
+                                    .text_center()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.apply_crop(&ApplyCrop, window, cx);
+                                    }))
+                                    .child("Accept (↵)"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .py(px(6.0))
+                                    .text_center()
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x34_34_3e))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.cancel_crop(&CancelCrop, window, cx);
+                                    }))
+                                    .child("Cancel (Esc)"),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_tools_grid_panel(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let Some(document) = &self.document else {
+            return div();
+        };
+
+        let state = &document.state;
+        let bounds = self.slider_state.bounds.clone();
+        let current_filter = state.color.filter_preset;
+        let active_group = self.active_tool_group;
+
+        let filter_presets = [
+            FilterPreset::None,
+            FilterPreset::BlackAndWhite,
+            FilterPreset::Sepia,
+            FilterPreset::WarmGold,
+            FilterPreset::CoolNordic,
+            FilterPreset::Vivid,
+        ];
+
+        div()
+            .w(px(PANEL_WIDTH))
+            .h_full()
+            .bg(rgb(PANEL_BG))
+            .border_l_1()
+            .border_color(rgb(BORDER_COLOR))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .child(
+                // Panel Header Quick Actions: Save, Save As, Undo, Redo
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .bg(rgb(CHROME))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a_2a_33))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.save(&Save, window, cx);
+                                    }))
+                                    .child("💾 Save"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a_2a_33))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.save_as(&SaveAs, window, cx);
+                                    }))
+                                    .child("📥 Save As"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a_2a_33))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.undo(&Undo, window, cx);
+                                    }))
+                                    .child("↩"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .rounded_sm()
+                                    .bg(rgb(0x2a_2a_33))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.redo(&Redo, window, cx);
+                                    }))
+                                    .child("↪"),
+                            ),
                     )
                     .child(
                         div()
@@ -1105,7 +2002,6 @@ impl Editor {
                     ),
             )
             .child(
-                // Scrollable Controls Body
                 div()
                     .flex_1()
                     .flex()
@@ -1115,7 +2011,7 @@ impl Editor {
                     .overflow_hidden()
                     // Live Histogram
                     .child(render_histogram(self.histogram.as_ref()))
-                    // Section 0: Transform & Straighten
+                    // Section: Colors (4x2 Grid of tools)
                     .child(
                         div()
                             .flex()
@@ -1129,59 +2025,285 @@ impl Editor {
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Transform & Straighten"),
+                                    .child("Colors"),
+                            )
+                            // 4x2 grid of buttons
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    // Row 1: Brightness/Contrast, Color Balance, Levels, Equalize
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .child(self.render_grid_tool_btn(
+                                                "◐",
+                                                "Light",
+                                                active_group == Some(ToolGroup::BrightnessContrast),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::BrightnessContrast) { None } else { Some(ToolGroup::BrightnessContrast) };
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "🎨",
+                                                "Balance",
+                                                active_group == Some(ToolGroup::ColorBalance),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::ColorBalance) { None } else { Some(ToolGroup::ColorBalance) };
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "📐",
+                                                "Levels",
+                                                active_group == Some(ToolGroup::Levels),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Levels) { None } else { Some(ToolGroup::Levels) };
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "🌓",
+                                                "Equalize",
+                                                false,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.auto_enhance(&AutoEnhance, window, cx);
+                                                }),
+                                            )),
+                                    )
+                                    // Row 2: Curves/Hue, Auto Enhance, Sharpen, Vignette
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .child(self.render_grid_tool_btn(
+                                                "📈",
+                                                "Hue/Sat",
+                                                active_group == Some(ToolGroup::HueSaturation),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::HueSaturation) { None } else { Some(ToolGroup::HueSaturation) };
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "🪄",
+                                                "Auto",
+                                                false,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.auto_enhance(&AutoEnhance, window, cx);
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "🗡",
+                                                "Sharpen",
+                                                active_group == Some(ToolGroup::Sharpen),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Sharpen) { None } else { Some(ToolGroup::Sharpen) };
+                                                    cx.notify();
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                "👁",
+                                                "Vignette",
+                                                active_group == Some(ToolGroup::Vignette),
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = if this.active_tool_group == Some(ToolGroup::Vignette) { None } else { Some(ToolGroup::Vignette) };
+                                                    cx.notify();
+                                                }),
+                                            )),
+                                    ),
+                            )
+                            // Contextual slider decks
+                            .when(active_group == Some(ToolGroup::BrightnessContrast), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .child(render_slider_row(
+                                            SliderSpec::BRIGHTNESS,
+                                            SliderSpec::BRIGHTNESS.get_value(state),
+                                            bounds.clone(),
+                                        ))
+                                        .child(render_slider_row(
+                                            SliderSpec::CONTRAST,
+                                            SliderSpec::CONTRAST.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(active_group == Some(ToolGroup::ColorBalance), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .child(render_slider_row(
+                                            SliderSpec::TEMPERATURE,
+                                            SliderSpec::TEMPERATURE.get_value(state),
+                                            bounds.clone(),
+                                        ))
+                                        .child(render_slider_row(
+                                            SliderSpec::TINT,
+                                            SliderSpec::TINT.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(active_group == Some(ToolGroup::Levels), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .child(render_slider_row(
+                                            SliderSpec::EXPOSURE,
+                                            SliderSpec::EXPOSURE.get_value(state),
+                                            bounds.clone(),
+                                        ))
+                                        .child(render_slider_row(
+                                            SliderSpec::HIGHLIGHTS,
+                                            SliderSpec::HIGHLIGHTS.get_value(state),
+                                            bounds.clone(),
+                                        ))
+                                        .child(render_slider_row(
+                                            SliderSpec::SHADOWS,
+                                            SliderSpec::SHADOWS.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(active_group == Some(ToolGroup::HueSaturation), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .child(render_slider_row(
+                                            SliderSpec::SATURATION,
+                                            SliderSpec::SATURATION.get_value(state),
+                                            bounds.clone(),
+                                        ))
+                                        .child(render_slider_row(
+                                            SliderSpec::HUE,
+                                            SliderSpec::HUE.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(active_group == Some(ToolGroup::Sharpen), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .child(render_slider_row(
+                                            SliderSpec::SHARPNESS,
+                                            SliderSpec::SHARPNESS.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            })
+                            .when(active_group == Some(ToolGroup::Vignette), |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_1()
+                                                .children(filter_presets.iter().map(|&preset| {
+                                                    let is_sel = preset == current_filter;
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(2.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                                        .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            this.edit(cx, |state| state.color.filter_preset = preset);
+                                                        }))
+                                                        .child(preset.label())
+                                                })),
+                                        )
+                                        .child(render_slider_row(
+                                            SliderSpec::VIGNETTE,
+                                            SliderSpec::VIGNETTE.get_value(state),
+                                            bounds.clone(),
+                                        )),
+                                )
+                            }),
+                    )
+                    // Section: Rotation (4x1 Grid + Straighten)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .rounded_md()
+                            .bg(rgb(SECTION_BG))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Rotation"),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .gap_1()
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .py(px(4.0))
-                                            .text_center()
-                                            .text_xs()
-                                            .rounded_md()
-                                            .bg(if self.crop_mode { rgb(ACCENT) } else { rgb(0x2d_2d_36) })
-                                            .text_color(if self.crop_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                this.toggle_crop(&ToggleCrop, window, cx);
-                                            }))
-                                            .child(if self.crop_mode { "Exit Crop" } else { "✂ Crop" }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .py(px(4.0))
-                                            .text_center()
-                                            .text_xs()
-                                            .rounded_md()
-                                            .bg(rgb(0x2d_2d_36))
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                this.rotate_cw(&RotateCW, window, cx);
-                                            }))
-                                            .child("Rotate ↻"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .py(px(4.0))
-                                            .text_center()
-                                            .text_xs()
-                                            .rounded_md()
-                                            .bg(rgb(0x2d_2d_36))
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                this.flip_h(&FlipH, window, cx);
-                                            }))
-                                            .child("Flip ⇄"),
-                                    ),
+                                    .child(self.render_grid_tool_btn(
+                                        "↺",
+                                        "Left",
+                                        false,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.rotate_ccw(&RotateCCW, window, cx);
+                                        }),
+                                    ))
+                                    .child(self.render_grid_tool_btn(
+                                        "↻",
+                                        "Right",
+                                        false,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.rotate_cw(&RotateCW, window, cx);
+                                        }),
+                                    ))
+                                    .child(self.render_grid_tool_btn(
+                                        "⇄",
+                                        "Flip H",
+                                        false,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.flip_h(&FlipH, window, cx);
+                                        }),
+                                    ))
+                                    .child(self.render_grid_tool_btn(
+                                        "⇅",
+                                        "Flip V",
+                                        false,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.flip_v(&FlipV, window, cx);
+                                        }),
+                                    )),
                             )
                             .child(render_slider_row(
                                 SliderSpec::ANGLE,
@@ -1189,7 +2311,7 @@ impl Editor {
                                 bounds.clone(),
                             )),
                     )
-                    // Section 1: Light & Auto
+                    // Section: Format (Resize & Crop)
                     .child(
                         div()
                             .flex()
@@ -1200,150 +2322,552 @@ impl Editor {
                             .bg(rgb(SECTION_BG))
                             .border_1()
                             .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Format"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .py(px(8.0))
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_1()
+                                            .rounded_sm()
+                                            .bg(rgb(0x2a_2a_33))
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.toggle_resize(&ToggleResize, window, cx);
+                                            }))
+                                            .child(div().text_sm().child("⤢"))
+                                            .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Resize…")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .py(px(8.0))
+                                            .flex()
+                                            .flex_col()
+                                            .items_center()
+                                            .justify_center()
+                                            .gap_1()
+                                            .rounded_sm()
+                                            .bg(if self.crop_mode { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                            .border_1()
+                                            .border_color(if self.crop_mode { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.toggle_crop(&ToggleCrop, window, cx);
+                                            }))
+                                            .child(div().text_sm().child("✂"))
+                                            .child(div().text_xs().text_color(if self.crop_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }).child("Crop")),
+                                    ),
+                            ),
+                    ),
+            )
+    }
+
+    fn render_grid_tool_btn(
+        &self,
+        icon: &'static str,
+        label: &'static str,
+        is_active: bool,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> gpui::Div {
+        div()
+            .flex_1()
+            .h(px(48.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(1.0))
+            .rounded_sm()
+            .bg(if is_active { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+            .border_1()
+            .border_color(if is_active { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                    .child(icon),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_MUTED) })
+                    .child(label),
+            )
+    }
+
+    fn render_resize_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let (orig_w, orig_h) = self.document.as_ref().map(|d| d.output_size()).unwrap_or((1, 1));
+        let width = self.resize_settings.width;
+        let height = self.resize_settings.height;
+        let unit_pct = self.resize_settings.unit_percent;
+        let keep_aspect = self.resize_settings.preserve_aspect_ratio;
+        let dest_folder = self.resize_settings.destination_folder.clone();
+        let current_fmt = self.resize_settings.format;
+
+        let dest_name = dest_folder
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Original image folder".to_string());
+
+        let formats = [
+            (None, "Keep original format"),
+            (Some(ExportFormat::Png), "PNG"),
+            (Some(ExportFormat::Jpeg), "JPEG"),
+            (Some(ExportFormat::WebP), "WebP"),
+            (Some(ExportFormat::Tiff), "TIFF"),
+        ];
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_a0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(420.0))
+                    .bg(rgb(0x23_23_2a))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_lg()
+                    .shadow_xl()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    // Header
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .pb_2()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Resize Images"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MUTED))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.resize_settings.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("✕"),
+                            ),
+                    )
+                    // New Dimensions
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("New dimensions"),
+                            )
+                            // Width row
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width:"))
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Light"),
-                                    )
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py(px(2.0))
-                                            .text_xs()
-                                            .rounded_md()
-                                            .bg(rgb(0x2d_2d_38))
-                                            .text_color(rgb(ACCENT))
-                                            .cursor(CursorStyle::PointingHand)
-                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                this.auto_enhance(&AutoEnhance, window, cx);
-                                            }))
-                                            .child("Auto Enhance"),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(if unit_pct { format!("{}%", width) } else { format!("{}", width) }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let step = if unit_pct { 5 } else { 10 };
+                                                        this.resize_settings.width = width.saturating_sub(step).max(1);
+                                                        if this.resize_settings.preserve_aspect_ratio {
+                                                            this.resize_settings.height = ((this.resize_settings.width as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let step = if unit_pct { 5 } else { 10 };
+                                                        this.resize_settings.width = (width + step).min(99999);
+                                                        if this.resize_settings.preserve_aspect_ratio {
+                                                            this.resize_settings.height = ((this.resize_settings.width as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            )
+                                            // Unit selector
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                        this.resize_settings.unit_percent = !this.resize_settings.unit_percent;
+                                                        if this.resize_settings.unit_percent {
+                                                            this.resize_settings.width = 100;
+                                                            this.resize_settings.height = 100;
+                                                        } else {
+                                                            this.resize_settings.width = this.resize_settings.original_width;
+                                                            this.resize_settings.height = this.resize_settings.original_height;
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child(if unit_pct { "% ▾" } else { "pixel ▾" }),
+                                            ),
                                     ),
                             )
-                            .child(render_slider_row(
-                                SliderSpec::EXPOSURE,
-                                SliderSpec::EXPOSURE.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::BRIGHTNESS,
-                                SliderSpec::BRIGHTNESS.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::CONTRAST,
-                                SliderSpec::CONTRAST.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::HIGHLIGHTS,
-                                SliderSpec::HIGHLIGHTS.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::SHADOWS,
-                                SliderSpec::SHADOWS.get_value(state),
-                                bounds.clone(),
-                            )),
+                            // Height row
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Height:"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .w(px(70.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x18_18_1c))
+                                                    .border_1()
+                                                    .border_color(rgb(BORDER_COLOR))
+                                                    .child(if unit_pct { format!("{}%", height) } else { format!("{}", height) }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let step = if unit_pct { 5 } else { 10 };
+                                                        this.resize_settings.height = height.saturating_sub(step).max(1);
+                                                        if this.resize_settings.preserve_aspect_ratio {
+                                                            this.resize_settings.width = ((this.resize_settings.height as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("−"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x2a_2a_33))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        let step = if unit_pct { 5 } else { 10 };
+                                                        this.resize_settings.height = (height + step).min(99999);
+                                                        if this.resize_settings.preserve_aspect_ratio {
+                                                            this.resize_settings.width = ((this.resize_settings.height as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("+"),
+                                            ),
+                                    ),
+                            )
+                            // Preserve aspect ratio checkbox
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.resize_settings.preserve_aspect_ratio = !this.resize_settings.preserve_aspect_ratio;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .w(px(14.0))
+                                            .h(px(14.0))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .bg(if keep_aspect { rgb(ACCENT) } else { rgb(0x18_18_1c) })
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_xs()
+                                            .text_color(rgb(0xff_ff_ff))
+                                            .child(if keep_aspect { "✓" } else { "" }),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Preserve original aspect ratios")),
+                            ),
                     )
-                    // Section 2: Color & Film Presets
+                    // Destination group
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_2()
-                            .p_2()
-                            .rounded_md()
-                            .bg(rgb(SECTION_BG))
-                            .border_1()
-                            .border_color(rgb(BORDER_COLOR))
+                            .gap_1()
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Color & Presets"),
+                                    .child("Destination"),
                             )
-                            // Filter preset pills
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x1c_1c_22))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                            this.resize_settings.destination_folder = Some(folder);
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(div().text_sm().child("📁"))
+                                            .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child(dest_name)),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Change…")),
+                            ),
+                    )
+                    // Format group
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child("Format"),
+                            )
                             .child(
                                 div()
                                     .flex()
                                     .flex_wrap()
                                     .gap_1()
-                                    .children(filter_presets.iter().map(|&preset| {
-                                        let is_sel = preset == current_filter;
+                                    .children(formats.iter().map(|&(fmt, label)| {
+                                        let is_sel = fmt == current_fmt;
                                         div()
                                             .px_2()
-                                            .py(px(2.0))
+                                            .py(px(3.0))
                                             .text_xs()
-                                            .rounded_md()
+                                            .rounded_sm()
                                             .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
                                             .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
                                             .cursor(CursorStyle::PointingHand)
                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                this.edit(cx, |state| state.color.filter_preset = preset);
+                                                this.resize_settings.format = fmt;
+                                                cx.notify();
                                             }))
-                                            .child(preset.label())
+                                            .child(label)
                                     })),
-                            )
-                            .child(render_slider_row(
-                                SliderSpec::SATURATION,
-                                SliderSpec::SATURATION.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::HUE,
-                                SliderSpec::HUE.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::TEMPERATURE,
-                                SliderSpec::TEMPERATURE.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::TINT,
-                                SliderSpec::TINT.get_value(state),
-                                bounds.clone(),
-                            ))
-                            .child(render_slider_row(
-                                SliderSpec::VIGNETTE,
-                                SliderSpec::VIGNETTE.get_value(state),
-                                bounds.clone(),
-                            )),
+                            ),
                     )
-                    // Section 3: Detail
+                    // Footer buttons
                     .child(
                         div()
                             .flex()
-                            .flex_col()
-                            .gap_2()
-                            .p_2()
-                            .rounded_md()
-                            .bg(rgb(SECTION_BG))
-                            .border_1()
+                            .items_center()
+                            .justify_end()
+                            .gap_3()
+                            .pt_2()
+                            .border_t_1()
                             .border_color(rgb(BORDER_COLOR))
                             .child(
                                 div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x34_34_3e))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.resize_settings.is_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .child("Detail"),
-                            )
-                            .child(render_slider_row(
-                                SliderSpec::SHARPNESS,
-                                SliderSpec::SHARPNESS.get_value(state),
-                                bounds.clone(),
-                            )),
+                                    .rounded_md()
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                        this.execute_resize(cx);
+                                    }))
+                                    .child("Execute"),
+                            ),
                     ),
             )
+    }
+
+    fn render_thumbnail_carousel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.thumbnail_pane_open || self.folder_images.is_empty() {
+            return div().into_any_element();
+        }
+
+        let current_idx = self.folder_index;
+        div()
+            .id("thumbnail-carousel")
+            .w_full()
+            .h(px(84.0))
+            .bg(rgb(0x16_16_1a))
+            .border_t_1()
+            .border_color(rgb(BORDER_COLOR))
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .overflow_x_scroll()
+            .gap_2()
+            .children(self.folder_images.iter().enumerate().map(|(idx, path)| {
+                let is_active = idx == current_idx;
+                let thumb = self.thumbnail_cache.get(path).cloned();
+                let path_clone = path.clone();
+
+                div()
+                    .flex_shrink_0()
+                    .w(px(96.0))
+                    .h(px(68.0))
+                    .rounded_sm()
+                    .overflow_hidden()
+                    .relative()
+                    .bg(rgb(0x22_22_28))
+                    .border_2()
+                    .border_color(if is_active { rgb(ACCENT) } else { rgb(0x38_38_44) })
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        if this.folder_index != idx {
+                            this.folder_index = idx;
+                            this.load(path_clone.clone(), cx);
+                        }
+                    }))
+                    .child(
+                        if let Some(texture) = thumb {
+                            canvas(
+                                move |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    let _ = window.paint_image(
+                                        bounds,
+                                        bounds,
+                                        Corners::all(px(0.0)),
+                                        texture,
+                                        0,
+                                        false,
+                                    );
+                                },
+                            )
+                            .size_full()
+                            .into_any_element()
+                        } else {
+                            div()
+                                .size_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .text_color(rgb(TEXT_MUTED))
+                                .child(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+                                .into_any_element()
+                        }
+                    )
+            }))
+            .into_any_element()
     }
 
     fn render_exif_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -1775,7 +3299,7 @@ impl Editor {
     fn status_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let zoom_text = format!("{:.0}%", self.scale() * 100.0);
         let mode = if self.compare { "Original" } else { "Edited" };
-        let panel_btn_text = if self.sidebar_open { "Hide Panel" } else { "Show Panel" };
+        let panel_btn_text = if self.sidebar_open { "Hide Tools" } else { "Tools 🛠" };
 
         div()
             .flex()
@@ -1806,6 +3330,15 @@ impl Editor {
                                 this.toggle_info(&ToggleInfo, window, cx);
                             }))
                             .child("Info (⌘I)"),
+                    )
+                    .child(
+                        div()
+                            .text_color(if self.thumbnail_pane_open { rgb(ACCENT) } else { rgb(MUTED) })
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                this.toggle_thumbnail_pane(&ToggleThumbnailPane, window, cx);
+                            }))
+                            .child(if self.thumbnail_pane_open { "Hide Thumbnails (F8)" } else { "Thumbnails (F8)" }),
                     )
                     .child(div().text_color(rgb(MUTED)).child(zoom_text))
                     .child(
@@ -1888,10 +3421,15 @@ impl Render for Editor {
             .on_action(cx.listener(Self::apply_crop))
             .on_action(cx.listener(Self::cancel_crop))
             .on_action(cx.listener(Self::reset_crop))
-            .on_action(cx.listener(Self::export));
+            .on_action(cx.listener(Self::export))
+            .on_action(cx.listener(Self::prev_image))
+            .on_action(cx.listener(Self::next_image))
+            .on_action(cx.listener(Self::toggle_thumbnail_pane))
+            .on_action(cx.listener(Self::toggle_resize));
 
-        // Floating Crop toolbar when active
+        // Top Toolbar
         if self.crop_mode {
+            // Dedicated Crop Top Bar matching gthumb-046_orig.jpg
             let presets = [
                 CropRatioPreset::Free,
                 CropRatioPreset::Square,
@@ -1908,10 +3446,7 @@ impl Render for Editor {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .px_4()
-                    .py_2()
-                    .bg(rgb(0x24_24_2c))
+                    .bg(rgb(CHROME))
                     .border_b_1()
                     .border_color(rgb(BORDER_COLOR))
                     .child(
@@ -1919,23 +3454,35 @@ impl Render for Editor {
                             .flex()
                             .items_center()
                             .justify_between()
+                            .px_4()
+                            .h(px(38.0))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap_3()
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(0xff_d6_0a))
-                                            .child("Crop Tool Active"),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_2()
+                                            .py(px(3.0))
+                                            .rounded_md()
+                                            .bg(rgb(0x32_32_3c))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.cancel_crop(&CancelCrop, window, cx);
+                                            }))
+                                            .child("❮ Back"),
                                     )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .text_color(rgb(MUTED))
-                                            .child("· Drag handles to crop. Enter to apply, Esc to cancel."),
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Crop"),
                                     ),
                             )
                             .child(
@@ -1959,7 +3506,7 @@ impl Render for Editor {
                                     )
                                     .child(
                                         div()
-                                            .px_3()
+                                            .px_4()
                                             .py(px(3.0))
                                             .text_xs()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -1970,16 +3517,21 @@ impl Render for Editor {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.apply_crop(&ApplyCrop, window, cx);
                                             }))
-                                            .child("Apply Crop"),
+                                            .child("Accept ✓"),
                                     ),
                             ),
                     )
-                    // Aspect ratio presets row
+                    // Aspect ratio presets sub-bar
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
+                            .px_4()
+                            .py(px(4.0))
+                            .bg(rgb(0x22_22_2a))
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
                             .child(
                                 div()
                                     .text_xs()
@@ -2019,17 +3571,201 @@ impl Render for Editor {
                             ),
                     ),
             );
+        } else {
+            // Standard Pix Viewer top toolbar
+            root = root.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .h(px(38.0))
+                    .bg(rgb(CHROME))
+                    .border_b_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .child(
+                        // Left: Navigation & File actions
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.open(&Open, window, cx);
+                                    }))
+                                    .child("Open…"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(if self.folder_images.len() > 1 { rgb(TEXT_PRIMARY) } else { rgb(MUTED) })
+                                    .cursor(if self.folder_images.len() > 1 { CursorStyle::PointingHand } else { CursorStyle::Arrow })
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.prev_image(&PrevImage, window, cx);
+                                    }))
+                                    .child("❮ Prev"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(if self.folder_images.len() > 1 { rgb(TEXT_PRIMARY) } else { rgb(MUTED) })
+                                    .cursor(if self.folder_images.len() > 1 { CursorStyle::PointingHand } else { CursorStyle::Arrow })
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.next_image(&NextImage, window, cx);
+                                    }))
+                                    .child("Next ❯"),
+                            )
+                            .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.save(&Save, window, cx);
+                                    }))
+                                    .child("Save"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.export(&Export, window, cx);
+                                    }))
+                                    .child("Export…"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_resize(&ToggleResize, window, cx);
+                                    }))
+                                    .child("Resize…"),
+                            ),
+                    )
+                    // Right: View controls & Tools sidebar toggle
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.zoom_out(&ZoomOut, window, cx);
+                                    }))
+                                    .child("−"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.fit(&Fit, window, cx);
+                                    }))
+                                    .child("Fit"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.actual_size(&ActualSize, window, cx);
+                                    }))
+                                    .child("100%"),
+                            )
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.zoom_in(&ZoomIn, window, cx);
+                                    }))
+                                    .child("+"),
+                            )
+                            .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .rounded_md()
+                                    .bg(if self.sidebar_open { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.sidebar_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_sidebar(&ToggleSidebar, window, cx);
+                                    }))
+                                    .child("Tools 🛠"),
+                            ),
+                    ),
+            );
         }
 
         root = root.child({
-            let mut split = div()
+            let center_area = div()
                 .flex_1()
-                .relative()
+                .h_full()
                 .flex()
-                .flex_row()
+                .flex_col()
                 .overflow_hidden()
-                .child(
-                    div()
+                .child({
+                    let mut canvas_container = div()
                         .flex_1()
                         .relative()
                         .overflow_hidden()
@@ -2040,10 +3776,83 @@ impl Render for Editor {
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_pan))
                         .on_mouse_up(MouseButton::Left, cx.listener(Self::end_pan))
                         .on_mouse_move(cx.listener(Self::drag_pan))
-                        .child(viewport.element()),
-                );
+                        .child(viewport.element());
 
-            if self.sidebar_open && self.document.is_some() {
+                    // Floating Next/Prev arrows on canvas sides (gthumb-053_orig.jpg)
+                    if self.folder_images.len() > 1 && !self.crop_mode {
+                        canvas_container = canvas_container
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(16.0))
+                                    .top(px(0.0))
+                                    .bottom(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(36.0))
+                                            .h(px(36.0))
+                                            .rounded_full()
+                                            .bg(rgb(0x22_22_2a))
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(|s| s.bg(rgb(0x38_38_46)).text_color(rgb(0xff_ff_ff)))
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.prev_image(&PrevImage, window, cx);
+                                            }))
+                                            .child("❮"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right(px(16.0))
+                                    .top(px(0.0))
+                                    .bottom(px(0.0))
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(36.0))
+                                            .h(px(36.0))
+                                            .rounded_full()
+                                            .bg(rgb(0x22_22_2a))
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor(CursorStyle::PointingHand)
+                                            .hover(|s| s.bg(rgb(0x38_38_46)).text_color(rgb(0xff_ff_ff)))
+                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                this.next_image(&NextImage, window, cx);
+                                            }))
+                                            .child("❯"),
+                                    ),
+                            );
+                    }
+                    canvas_container
+                })
+                .when(self.thumbnail_pane_open && !self.folder_images.is_empty(), |this| {
+                    this.child(self.render_thumbnail_carousel(cx))
+                });
+
+            let mut split = div()
+                .flex_1()
+                .relative()
+                .flex()
+                .flex_row()
+                .overflow_hidden()
+                .child(center_area);
+
+            if (self.sidebar_open || self.crop_mode) && self.document.is_some() {
                 split = split.child(
                     div()
                         .on_mouse_down(MouseButton::Left, cx.listener(Self::on_slider_mouse_down))
@@ -2055,6 +3864,11 @@ impl Render for Editor {
             split
         })
         .child(self.status_bar(cx));
+
+        // Resize Modal overlay if active (gthumb-054_orig.jpg)
+        if self.resize_settings.is_open {
+            root = root.child(self.render_resize_modal(cx));
+        }
 
         // Export Modal overlay if active
         if self.export_settings.is_open {

@@ -22,8 +22,9 @@ pub use color::{
     TEMPERATURE_NEUTRAL_KELVIN,
 };
 pub use filter::{gaussian_blur, unsharp_mask};
-pub use metadata::ImageMetadata;
+pub use metadata::{ImageMetadata, attach_exif};
 pub use transform::{
-    crop, downsample_to_fit, flip_horizontal, flip_vertical, resize, rotate_orthogonal,
-    rotate_straighten_autocrop, straightened_size, CropRatioPreset, CropRect, OrthogonalRotation,
+    apply_exif_orientation, crop, downsample_to_fit, flip_horizontal, flip_vertical, resize,
+    rotate_orthogonal, rotate_straighten_autocrop, straightened_size, CropRatioPreset, CropRect,
+    OrthogonalRotation,
 };

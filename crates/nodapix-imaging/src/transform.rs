@@ -105,6 +105,28 @@ impl CropRect {
         (x, y, w, h)
     }
 
+    /// Construct a normalized CropRect from integer pixel coordinates.
+    pub fn from_pixel_coords(x: u32, y: u32, w: u32, h: u32, img_w: u32, img_h: u32) -> Self {
+        if img_w == 0 || img_h == 0 {
+            return Self {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            };
+        }
+        let px_x = (x as f32 / img_w as f32).clamp(0.0, 1.0);
+        let px_y = (y as f32 / img_h as f32).clamp(0.0, 1.0);
+        let px_w = (w as f32 / img_w as f32).clamp(0.01, 1.0 - px_x);
+        let px_h = (h as f32 / img_h as f32).clamp(0.01, 1.0 - px_y);
+        Self {
+            x: px_x,
+            y: px_y,
+            width: px_w,
+            height: px_h,
+        }
+    }
+
     /// Construct a centered crop rectangle with a given aspect ratio within image bounds.
     pub fn centered_with_ratio(ratio: f32, img_w: f32, img_h: f32) -> Self {
         if img_w <= 0.0 || img_h <= 0.0 || ratio <= 0.0 {
@@ -212,6 +234,44 @@ pub fn rotate_orthogonal<T: Copy + Default + Send + Sync>(
                 });
             out
         }
+    }
+}
+
+/// Bake the EXIF orientation tag into the pixels.
+///
+/// The tag asks for one of eight dihedral transforms of the stored raster. Applying
+/// it at decode time means the pipeline, the canvas and the exporter all work in
+/// display orientation, and exports can carry a normalised tag.
+pub fn apply_exif_orientation<T: Copy + Default + Send + Sync>(
+    buffer: &PixelBuffer<T>,
+    orientation: u32,
+) -> PixelBuffer<T> {
+    use OrthogonalRotation::{Rotate90, Rotate180, Rotate270};
+    match orientation {
+        2 => {
+            let mut out = buffer.clone();
+            flip_horizontal(&mut out);
+            out
+        }
+        3 => rotate_orthogonal(buffer, Rotate180),
+        4 => {
+            let mut out = buffer.clone();
+            flip_vertical(&mut out);
+            out
+        }
+        5 => {
+            let mut out = rotate_orthogonal(buffer, Rotate90);
+            flip_horizontal(&mut out);
+            out
+        }
+        6 => rotate_orthogonal(buffer, Rotate90),
+        7 => {
+            let mut out = rotate_orthogonal(buffer, Rotate270);
+            flip_horizontal(&mut out);
+            out
+        }
+        8 => rotate_orthogonal(buffer, Rotate270),
+        _ => buffer.clone(),
     }
 }
 
