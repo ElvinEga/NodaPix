@@ -172,7 +172,16 @@ pub fn downsample_to_fit(buffer: &PixelBuffer<f32>, max_dim: u32) -> PixelBuffer
     let scale = max_dim as f32 / max_current as f32;
     let dst_w = ((buffer.width as f32 * scale).round() as u32).max(1);
     let dst_h = ((buffer.height as f32 * scale).round() as u32).max(1);
+    resize(buffer, dst_w, dst_h)
+}
 
+/// Resize a buffer to arbitrary dimensions using bilinear sampling.
+pub fn resize(buffer: &PixelBuffer<f32>, dst_w: u32, dst_h: u32) -> PixelBuffer<f32> {
+    if buffer.width == dst_w && buffer.height == dst_h {
+        return buffer.clone();
+    }
+    let dst_w = dst_w.max(1);
+    let dst_h = dst_h.max(1);
     let mut out = PixelBuffer::new(dst_w, dst_h);
     let x_ratio = buffer.width as f32 / dst_w as f32;
     let y_ratio = buffer.height as f32 / dst_h as f32;

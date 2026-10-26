@@ -141,3 +141,16 @@ impl ImageBackend for RustImageBackend {
         Ok(())
     }
 }
+
+#[cfg(target_os = "macos")]
+pub mod apple_image_io;
+
+#[cfg(target_os = "macos")]
+pub use apple_image_io::AppleImageIOBackend;
+
+#[cfg(target_os = "macos")]
+pub type NativeBackend = AppleImageIOBackend;
+
+#[cfg(not(target_os = "macos"))]
+pub type NativeBackend = RustImageBackend;
+

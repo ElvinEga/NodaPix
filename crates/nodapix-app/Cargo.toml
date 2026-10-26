@@ -10,7 +10,9 @@ nodapix-core = { path = "../nodapix-core" }
 gpui.workspace = true
 # runtime_shaders compiles the Metal sources at launch instead of requiring the
 # Xcode Metal toolchain at build time. Drop this feature for release packaging.
-gpui_macos = { workspace = true, features = ["runtime_shaders"] }
+# font-kit installs the CoreText-backed text system; without it gpui_macos falls
+# back to NoopTextSystem and no text is drawn at all.
+gpui_macos = { workspace = true, features = ["runtime_shaders", "font-kit"] }
 rfd.workspace = true
 crossbeam-channel.workspace = true
 image.workspace = true

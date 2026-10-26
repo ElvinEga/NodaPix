@@ -115,3 +115,16 @@ fn test_backend_png_encode_decode() {
     assert!((px[0] - 1.0).abs() < 0.05);
     assert!((px[1] - 0.5).abs() < 0.05);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_apple_image_io_decode() {
+    use nodapix_imaging::AppleImageIOBackend;
+
+    let sample_path = std::path::PathBuf::from(
+        "/Users/solution/Development/rea/pix/pix/extensions/webalbums/data/albumthemes/Classic/preview.png",
+    );
+    let backend = AppleImageIOBackend::new();
+    let decoded = backend.decode_from_path(&sample_path).expect("Apple Image I/O decode");
+    assert!(decoded.width > 0 && decoded.height > 0);
+}

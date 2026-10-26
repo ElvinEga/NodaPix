@@ -14,8 +14,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    ActualSize, Export, Fit, FlipH, FlipV, Open, Quit, Redo, ResetAdjustments, ResetAll, RotateCCW,
-    RotateCW, ToggleCompare, ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ActualSize, ApplyCrop, CancelCrop, Export, Fit, FlipH, FlipV, Open, Quit, Redo,
+    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop,
+    ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -41,6 +42,9 @@ fn main() {
             KeyBinding::new("shift-v", FlipV, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-e", ToggleSidebar, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
+            KeyBinding::new("c", ToggleCrop, Some(KEY_CONTEXT)),
+            KeyBinding::new("enter", ApplyCrop, Some(KEY_CONTEXT)),
+            KeyBinding::new("escape", CancelCrop, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-\\", ToggleCompare, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-backspace", ResetAll, Some(KEY_CONTEXT)),
         ]);
@@ -72,6 +76,9 @@ fn main() {
                 MenuItem::action("Toggle Adjustments Panel", ToggleSidebar),
             ]),
             Menu::new("Image").items(vec![
+                MenuItem::action("Crop", ToggleCrop),
+                MenuItem::action("Reset Crop", ResetCrop),
+                MenuItem::separator(),
                 MenuItem::action("Rotate Left", RotateCCW),
                 MenuItem::action("Rotate Right", RotateCW),
                 MenuItem::action("Flip Horizontal", FlipH),

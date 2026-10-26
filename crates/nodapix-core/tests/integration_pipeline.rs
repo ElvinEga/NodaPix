@@ -12,6 +12,7 @@ fn test_real_image_full_pipeline_roundtrip() {
     assert!(sample_path.exists(), "Sample test image must exist");
 
     let backend = RustImageBackend::new();
+    let source_bytes = std::fs::read(&sample_path).expect("Read sample bytes");
     let original_buf = backend
         .decode_from_path(&sample_path)
         .expect("Decode real image");
@@ -88,6 +89,14 @@ fn test_real_image_full_pipeline_roundtrip() {
     let reloaded = backend.decode_from_path(&out_png).expect("Reload exported PNG");
     assert_eq!(reloaded.width, expected_w);
     assert_eq!(reloaded.height, expected_h);
+
+    // Non-destructive editing is the core guarantee: exporting must never touch
+    // the file the document was loaded from.
+    assert_eq!(
+        std::fs::read(&sample_path).expect("Re-read sample bytes"),
+        source_bytes,
+        "export modified the source file"
+    );
 
     // Clean up
     let _ = std::fs::remove_file(out_png);

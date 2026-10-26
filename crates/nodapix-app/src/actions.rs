@@ -22,5 +22,9 @@ actions!(
         ResetAll,
         ResetAdjustments,
         ToggleSidebar,
+        ToggleCrop,
+        ApplyCrop,
+        CancelCrop,
+        ResetCrop,
     ]
 );

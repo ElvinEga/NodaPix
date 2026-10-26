@@ -11,6 +11,7 @@ Icon
 ._*
 .Spotlight-V100
 .Trashes
+*.iconset/
 
 # Editor & IDE files
 .idea/
