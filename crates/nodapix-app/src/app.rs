@@ -29,6 +29,7 @@ use crate::actions::{
 use crate::canvas::{
     fit_scale, hit_test_crop, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
 };
+use crate::icon::LucideIcon;
 use crate::panel::{
     render_histogram, render_slider_row, SliderId, SliderSpec, SliderState, ToolGroup, ALL_SPECS,
     BORDER_COLOR, PANEL_BG, PANEL_WIDTH, SECTION_BG, TEXT_MUTED, TEXT_PRIMARY,
@@ -1790,9 +1791,11 @@ impl Editor {
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_xs()
-                                            .text_color(rgb(0xff_ff_ff))
-                                            .child(if is_portrait { "✓" } else { "" }),
+                                            .children(if is_portrait {
+                                                Some(LucideIcon::Check.element(10.0, rgb(0xff_ff_ff)))
+                                            } else {
+                                                None
+                                            }),
                                     )
                                     .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Invert aspect ratio")),
                             )
@@ -1823,9 +1826,11 @@ impl Editor {
                                                     .flex()
                                                     .items_center()
                                                     .justify_center()
-                                                    .text_xs()
-                                                    .text_color(rgb(0xff_ff_ff))
-                                                    .child(if multiple_of.is_some() { "✓" } else { "" }),
+                                                    .children(if multiple_of.is_some() {
+                                                        Some(LucideIcon::Check.element(10.0, rgb(0xff_ff_ff)))
+                                                    } else {
+                                                        None
+                                                    }),
                                             )
                                             .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Multiple of:")),
                                     )
@@ -1935,6 +1940,9 @@ impl Editor {
                             .gap_1()
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .rounded_sm()
@@ -1945,10 +1953,14 @@ impl Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.save(&Save, window, cx);
                                     }))
-                                    .child("💾 Save"),
+                                    .child(LucideIcon::Save.element(13.0, rgb(TEXT_PRIMARY)))
+                                    .child("Save"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .rounded_sm()
@@ -1959,35 +1971,38 @@ impl Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.save_as(&SaveAs, window, cx);
                                     }))
-                                    .child("📥 Save As"),
+                                    .child(LucideIcon::Download.element(13.0, rgb(TEXT_PRIMARY)))
+                                    .child("Save As"),
                             )
                             .child(
                                 div()
-                                    .px_2()
-                                    .py(px(3.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(26.0))
+                                    .h(px(22.0))
                                     .rounded_sm()
                                     .bg(rgb(0x2a_2a_33))
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_PRIMARY))
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.undo(&Undo, window, cx);
                                     }))
-                                    .child("↩"),
+                                    .child(LucideIcon::Undo2.element(13.0, rgb(TEXT_PRIMARY))),
                             )
                             .child(
                                 div()
-                                    .px_2()
-                                    .py(px(3.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(26.0))
+                                    .h(px(22.0))
                                     .rounded_sm()
                                     .bg(rgb(0x2a_2a_33))
-                                    .text_xs()
-                                    .text_color(rgb(TEXT_PRIMARY))
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.redo(&Redo, window, cx);
                                     }))
-                                    .child("↪"),
+                                    .child(LucideIcon::Redo2.element(13.0, rgb(TEXT_PRIMARY))),
                             ),
                     )
                     .child(
@@ -2041,7 +2056,7 @@ impl Editor {
                                             .flex()
                                             .gap_1()
                                             .child(self.render_grid_tool_btn(
-                                                "◐",
+                                                LucideIcon::Sun,
                                                 "Light",
                                                 active_group == Some(ToolGroup::BrightnessContrast),
                                                 cx.listener(|this, _, _, cx| {
@@ -2050,7 +2065,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "🎨",
+                                                LucideIcon::Palette,
                                                 "Balance",
                                                 active_group == Some(ToolGroup::ColorBalance),
                                                 cx.listener(|this, _, _, cx| {
@@ -2059,7 +2074,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "📐",
+                                                LucideIcon::Sliders,
                                                 "Levels",
                                                 active_group == Some(ToolGroup::Levels),
                                                 cx.listener(|this, _, _, cx| {
@@ -2068,7 +2083,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "🌓",
+                                                LucideIcon::Contrast,
                                                 "Equalize",
                                                 false,
                                                 cx.listener(|this, _, window, cx| {
@@ -2082,7 +2097,7 @@ impl Editor {
                                             .flex()
                                             .gap_1()
                                             .child(self.render_grid_tool_btn(
-                                                "📈",
+                                                LucideIcon::Activity,
                                                 "Hue/Sat",
                                                 active_group == Some(ToolGroup::HueSaturation),
                                                 cx.listener(|this, _, _, cx| {
@@ -2091,7 +2106,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "🪄",
+                                                LucideIcon::Wand2,
                                                 "Auto",
                                                 false,
                                                 cx.listener(|this, _, window, cx| {
@@ -2099,7 +2114,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "🗡",
+                                                LucideIcon::Zap,
                                                 "Sharpen",
                                                 active_group == Some(ToolGroup::Sharpen),
                                                 cx.listener(|this, _, _, cx| {
@@ -2108,7 +2123,7 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                "👁",
+                                                LucideIcon::Eye,
                                                 "Vignette",
                                                 active_group == Some(ToolGroup::Vignette),
                                                 cx.listener(|this, _, _, cx| {
@@ -2273,7 +2288,7 @@ impl Editor {
                                     .flex()
                                     .gap_1()
                                     .child(self.render_grid_tool_btn(
-                                        "↺",
+                                        LucideIcon::RotateCcw,
                                         "Left",
                                         false,
                                         cx.listener(|this, _, window, cx| {
@@ -2281,7 +2296,7 @@ impl Editor {
                                         }),
                                     ))
                                     .child(self.render_grid_tool_btn(
-                                        "↻",
+                                        LucideIcon::RotateCw,
                                         "Right",
                                         false,
                                         cx.listener(|this, _, window, cx| {
@@ -2289,7 +2304,7 @@ impl Editor {
                                         }),
                                     ))
                                     .child(self.render_grid_tool_btn(
-                                        "⇄",
+                                        LucideIcon::FlipHorizontal,
                                         "Flip H",
                                         false,
                                         cx.listener(|this, _, window, cx| {
@@ -2297,7 +2312,7 @@ impl Editor {
                                         }),
                                     ))
                                     .child(self.render_grid_tool_btn(
-                                        "⇅",
+                                        LucideIcon::FlipVertical,
                                         "Flip V",
                                         false,
                                         cx.listener(|this, _, window, cx| {
@@ -2350,7 +2365,7 @@ impl Editor {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.toggle_resize(&ToggleResize, window, cx);
                                             }))
-                                            .child(div().text_sm().child("⤢"))
+                                            .child(LucideIcon::Scaling.element(18.0, rgb(TEXT_PRIMARY)))
                                             .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Resize…")),
                                     )
                                     .child(
@@ -2370,7 +2385,7 @@ impl Editor {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.toggle_crop(&ToggleCrop, window, cx);
                                             }))
-                                            .child(div().text_sm().child("✂"))
+                                            .child(LucideIcon::Crop.element(18.0, if self.crop_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
                                             .child(div().text_xs().text_color(if self.crop_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }).child("Crop")),
                                     ),
                             ),
@@ -2380,7 +2395,7 @@ impl Editor {
 
     fn render_grid_tool_btn(
         &self,
-        icon: &'static str,
+        icon: LucideIcon,
         label: &'static str,
         is_active: bool,
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -2392,19 +2407,14 @@ impl Editor {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(1.0))
+            .gap(px(2.0))
             .rounded_sm()
             .bg(if is_active { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
             .border_1()
             .border_color(if is_active { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
             .cursor(CursorStyle::PointingHand)
             .on_mouse_down(MouseButton::Left, on_click)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
-                    .child(icon),
-            )
+            .child(icon.element(17.0, if is_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
             .child(
                 div()
                     .text_xs()
@@ -2480,7 +2490,7 @@ impl Editor {
                                         this.resize_settings.is_open = false;
                                         cx.notify();
                                     }))
-                                    .child("✕"),
+                                    .child(LucideIcon::X.element(14.0, rgb(TEXT_MUTED))),
                             ),
                     )
                     // New Dimensions
@@ -2668,9 +2678,11 @@ impl Editor {
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .text_xs()
-                                            .text_color(rgb(0xff_ff_ff))
-                                            .child(if keep_aspect { "✓" } else { "" }),
+                                            .children(if keep_aspect {
+                                                Some(LucideIcon::Check.element(10.0, rgb(0xff_ff_ff)))
+                                            } else {
+                                                None
+                                            }),
                                     )
                                     .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child("Preserve original aspect ratios")),
                             ),
@@ -2710,7 +2722,7 @@ impl Editor {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .child(div().text_sm().child("📁"))
+                                            .child(LucideIcon::FolderOpen.element(14.0, rgb(ACCENT)))
                                             .child(div().text_xs().text_color(rgb(TEXT_PRIMARY)).child(dest_name)),
                                     )
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Change…")),
@@ -3299,7 +3311,7 @@ impl Editor {
     fn status_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let zoom_text = format!("{:.0}%", self.scale() * 100.0);
         let mode = if self.compare { "Original" } else { "Edited" };
-        let panel_btn_text = if self.sidebar_open { "Hide Tools" } else { "Tools 🛠" };
+        let panel_btn_text = if self.sidebar_open { "Hide Tools" } else { "Tools" };
 
         div()
             .flex()
@@ -3324,30 +3336,42 @@ impl Editor {
                     .gap_3()
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_color(rgb(ACCENT))
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                 this.toggle_info(&ToggleInfo, window, cx);
                             }))
-                            .child("Info (⌘I)"),
+                            .child(LucideIcon::Info.element(12.0, rgb(ACCENT)))
+                            .child("Info"),
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_color(if self.thumbnail_pane_open { rgb(ACCENT) } else { rgb(MUTED) })
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                 this.toggle_thumbnail_pane(&ToggleThumbnailPane, window, cx);
                             }))
-                            .child(if self.thumbnail_pane_open { "Hide Thumbnails (F8)" } else { "Thumbnails (F8)" }),
+                            .child(LucideIcon::Film.element(12.0, if self.thumbnail_pane_open { rgb(ACCENT) } else { rgb(MUTED) }))
+                            .child(if self.thumbnail_pane_open { "Hide Thumbnails" } else { "Thumbnails" }),
                     )
                     .child(div().text_color(rgb(MUTED)).child(zoom_text))
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .text_color(rgb(ACCENT))
                             .cursor(CursorStyle::PointingHand)
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                 this.toggle_sidebar(&ToggleSidebar, window, cx);
                             }))
+                            .child(LucideIcon::SlidersHorizontal.element(12.0, rgb(ACCENT)))
                             .child(panel_btn_text),
                     ),
             )
@@ -3475,7 +3499,8 @@ impl Render for Editor {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.cancel_crop(&CancelCrop, window, cx);
                                             }))
-                                            .child("❮ Back"),
+                                            .child(LucideIcon::ChevronLeft.element(14.0, rgb(TEXT_PRIMARY)))
+                                            .child(div().text_xs().child("Back")),
                                     )
                                     .child(
                                         div()
@@ -3506,7 +3531,10 @@ impl Render for Editor {
                                     )
                                     .child(
                                         div()
-                                            .px_4()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_3()
                                             .py(px(3.0))
                                             .text_xs()
                                             .font_weight(gpui::FontWeight::SEMIBOLD)
@@ -3517,7 +3545,8 @@ impl Render for Editor {
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.apply_crop(&ApplyCrop, window, cx);
                                             }))
-                                            .child("Accept ✓"),
+                                            .child(LucideIcon::Check.element(14.0, rgb(0xff_ff_ff)))
+                                            .child("Accept"),
                                     ),
                             ),
                     )
@@ -3591,6 +3620,9 @@ impl Render for Editor {
                             .gap_2()
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3601,10 +3633,14 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.open(&Open, window, cx);
                                     }))
+                                    .child(LucideIcon::FolderOpen.element(13.0, rgb(TEXT_PRIMARY)))
                                     .child("Open…"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3615,10 +3651,14 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.prev_image(&PrevImage, window, cx);
                                     }))
-                                    .child("❮ Prev"),
+                                    .child(LucideIcon::ChevronLeft.element(13.0, if self.folder_images.len() > 1 { rgb(TEXT_PRIMARY) } else { rgb(MUTED) }))
+                                    .child("Prev"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3629,11 +3669,15 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.next_image(&NextImage, window, cx);
                                     }))
-                                    .child("Next ❯"),
+                                    .child("Next")
+                                    .child(LucideIcon::ChevronRight.element(13.0, if self.folder_images.len() > 1 { rgb(TEXT_PRIMARY) } else { rgb(MUTED) })),
                             )
                             .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3644,10 +3688,14 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.save(&Save, window, cx);
                                     }))
+                                    .child(LucideIcon::Save.element(13.0, rgb(TEXT_PRIMARY)))
                                     .child("Save"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3658,10 +3706,14 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.export(&Export, window, cx);
                                     }))
+                                    .child(LucideIcon::Download.element(13.0, rgb(TEXT_PRIMARY)))
                                     .child("Export…"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3672,6 +3724,7 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.toggle_resize(&ToggleResize, window, cx);
                                     }))
+                                    .child(LucideIcon::Scaling.element(13.0, rgb(TEXT_PRIMARY)))
                                     .child("Resize…"),
                             ),
                     )
@@ -3683,20 +3736,24 @@ impl Render for Editor {
                             .gap_2()
                             .child(
                                 div()
-                                    .px_2()
-                                    .py(px(3.0))
-                                    .text_xs()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.0))
+                                    .h(px(22.0))
                                     .rounded_md()
                                     .bg(rgb(0x32_32_3c))
-                                    .text_color(rgb(TEXT_PRIMARY))
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.zoom_out(&ZoomOut, window, cx);
                                     }))
-                                    .child("−"),
+                                    .child(LucideIcon::Minus.element(13.0, rgb(TEXT_PRIMARY))),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3707,10 +3764,14 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.fit(&Fit, window, cx);
                                     }))
+                                    .child(LucideIcon::Minimize2.element(12.0, rgb(TEXT_PRIMARY)))
                                     .child("Fit"),
                             )
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_2()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3721,25 +3782,30 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.actual_size(&ActualSize, window, cx);
                                     }))
+                                    .child(LucideIcon::ZoomIn.element(12.0, rgb(TEXT_PRIMARY)))
                                     .child("100%"),
                             )
                             .child(
                                 div()
-                                    .px_2()
-                                    .py(px(3.0))
-                                    .text_xs()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.0))
+                                    .h(px(22.0))
                                     .rounded_md()
                                     .bg(rgb(0x32_32_3c))
-                                    .text_color(rgb(TEXT_PRIMARY))
                                     .cursor(CursorStyle::PointingHand)
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.zoom_in(&ZoomIn, window, cx);
                                     }))
-                                    .child("+"),
+                                    .child(LucideIcon::Plus.element(13.0, rgb(TEXT_PRIMARY))),
                             )
                             .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
                             .child(
                                 div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_3()
                                     .py(px(3.0))
                                     .text_xs()
@@ -3751,7 +3817,8 @@ impl Render for Editor {
                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                         this.toggle_sidebar(&ToggleSidebar, window, cx);
                                     }))
-                                    .child("Tools 🛠"),
+                                    .child(LucideIcon::SlidersHorizontal.element(13.0, if self.sidebar_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                    .child("Tools"),
                             ),
                     ),
             );
@@ -3797,16 +3864,15 @@ impl Render for Editor {
                                             .bg(rgb(0x22_22_2a))
                                             .border_1()
                                             .border_color(rgb(BORDER_COLOR))
-                                            .text_color(rgb(TEXT_PRIMARY))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .cursor(CursorStyle::PointingHand)
-                                            .hover(|s| s.bg(rgb(0x38_38_46)).text_color(rgb(0xff_ff_ff)))
+                                            .hover(|s| s.bg(rgb(0x38_38_46)))
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.prev_image(&PrevImage, window, cx);
                                             }))
-                                            .child("❮"),
+                                            .child(LucideIcon::ChevronLeft.element(20.0, rgb(TEXT_PRIMARY))),
                                     ),
                             )
                             .child(
@@ -3825,16 +3891,15 @@ impl Render for Editor {
                                             .bg(rgb(0x22_22_2a))
                                             .border_1()
                                             .border_color(rgb(BORDER_COLOR))
-                                            .text_color(rgb(TEXT_PRIMARY))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .cursor(CursorStyle::PointingHand)
-                                            .hover(|s| s.bg(rgb(0x38_38_46)).text_color(rgb(0xff_ff_ff)))
+                                            .hover(|s| s.bg(rgb(0x38_38_46)))
                                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                 this.next_image(&NextImage, window, cx);
                                             }))
-                                            .child("❯"),
+                                            .child(LucideIcon::ChevronRight.element(20.0, rgb(TEXT_PRIMARY))),
                                     ),
                             );
                     }

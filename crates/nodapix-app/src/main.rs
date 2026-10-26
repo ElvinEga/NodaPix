@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod canvas;
+mod icon;
 mod panel;
 mod render;
 
