@@ -16,29 +16,34 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
   - *Description*: Canvas interactive loupe/sampler showing RGB (0–255), HEX, and sRGB values under cursor. Clicking in "White Balance" mode samples a neutral gray patch and automatically calculates Kelvin temperature and tint offsets.
   - *Status*: Implemented in `nodapix-imaging/src/color.rs` (`calculate_white_balance_from_sample`) and `nodapix-app/src/app.rs` with Lucide pipette icon, live floating loupe, and 1-click white balance neutralization.
 
-- [ ] **Red-Eye Removal Tool**
+- [x] **Red-Eye Removal Tool**
   - *Pix reference*: [`pix/extensions/red_eye_removal/gth-file-tool-red-eye.c`](file:///Users/solution/Development/rea/pix/pix/extensions/red_eye_removal/gth-file-tool-red-eye.c)
-  - *Description*: Click or drag a circular selection over flash pupil reflections. Pixels within the circle exceeding the red-ratio threshold ($R > 1.2 \times \max(G, B)$) are desaturated and darkened while preserving pupil specular highlights.
-  - *Target*: `crates/nodapix-imaging/src/color.rs` & `crates/nodapix-app/src/canvas.rs`
+  - *Description*: Click on flash pupil reflections on the image canvas. Pixels within the brush exceeding the red-ratio threshold are neutralized to natural dark iris tones while preserving specular highlights and edge feathering.
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` (`RedEyeFix`, `apply_red_eye_fix_to_buffer`) and `nodapix-app/src/app.rs` with `ToolGroup::RedEye`, Lucide eye icon, live on-canvas target ring, brush radius picker, and non-destructive undo/redo.
 
-- [ ] **Extended Crop Composition Guides**
+- [x] **Extended Crop Composition Guides**
   - *Pix reference*: [`pix/extensions/file_tools/gth-file-tool-crop.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-crop.c)
-  - *Description*: In addition to the existing Rule of Thirds grid, provide toggleable overlays for:
-    - Golden Ratio / Golden Spiral
-    - Center crosshairs & diagonal harmony lines
-  - *Target*: `crates/nodapix-app/src/canvas.rs`
+  - *Description*: In addition to the Rule of Thirds grid, provide toggleable overlays for:
+    - Rule of Thirds (1/3 and 2/3 lines)
+    - Golden Ratio (0.382 and 0.618 lines)
+    - Center crosshairs (0.5 lines)
+    - Diagonal harmony lines (corner-to-corner)
+    - None (clean crop box)
+  - *Status*: Implemented in `nodapix-app/src/canvas.rs` (`CropGuide`) and toggleable via guide selection pills in both the Crop Sidebar and Crop Top Bar.
 
 ---
 
 ## 2. Advanced Color & Tonal Manipulation
 
-- [ ] **Interactive Spline Tone Curves Editor**
+- [x] **Interactive Spline Tone Curves Editor**
   - *Pix reference*: [`pix/extensions/file_tools/gth-curve-editor.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-curve-editor.c), [`gth-file-tool-curves.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-curves.c)
-  - *Description*: A visual 256×256 tonal curve canvas supporting natural cubic spline interpolation with draggable control points. Supports:
+  - *Description*: A visual tonal curve canvas supporting natural cubic spline interpolation with draggable control points. Supports:
     - Composite RGB curve (contrast and tone mapping)
     - Per-channel Red, Green, and Blue curves for color grading
     - Underlying live histogram backdrop
-  - *Target*: `crates/nodapix-imaging/src/color.rs` & `crates/nodapix-app/src/app.rs`
+    - Fritsch-Carlson monotonic cubic spline interpolation (no overshoot or ringing)
+    - Click to add points, right-click to delete points, and quick presets
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` (`ToneCurve`, `Curves`, Fritsch-Carlson evaluator, 1024-entry LUT builder) and `nodapix-app/src/app.rs` with `ToolGroup::Curves`, Lucide `spline.svg`, channel tabs, live histogram backdrop, draggable control points, and presets.
 
 - [x] **Grayscale & Channel Mixer**
   - *Pix reference*: [`pix/extensions/file_tools/gth-file-tool-grayscale.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-grayscale.c)

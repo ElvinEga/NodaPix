@@ -16,9 +16,10 @@ pub use buffer::{
     linear_to_srgb, linear_to_srgb_u8, srgb_to_linear, srgb_u8_to_linear, PixelBuffer,
 };
 pub use color::{
-    apply_color_adjustments, calculate_auto_levels, calculate_white_balance_from_sample,
-    compute_histogram, kelvin_to_white_balance_gains, lerp, midtone_weight, slider_to_kelvin,
-    ColorAdjustments, FilterPreset, ImageHistogram, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN,
+    apply_color_adjustments, apply_red_eye_fix_to_buffer, calculate_auto_levels,
+    calculate_white_balance_from_sample, compute_histogram, kelvin_to_white_balance_gains, lerp,
+    midtone_weight, slider_to_kelvin, ColorAdjustments, CurvePoint, Curves, FilterPreset,
+    ImageHistogram, RedEyeFix, ToneCurve, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN,
     TEMPERATURE_NEUTRAL_KELVIN,
 };
 pub use filter::{gaussian_blur, unsharp_mask};

@@ -23,6 +23,29 @@ pub enum CropHandle {
     Inside,
 }
 
+/// Composition guide overlay lines inside the crop box (inspired by Pix).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum CropGuide {
+    #[default]
+    RuleOfThirds,
+    GoldenRatio,
+    CenterCross,
+    Diagonals,
+    None,
+}
+
+impl CropGuide {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RuleOfThirds => "Thirds",
+            Self::GoldenRatio => "Golden",
+            Self::CenterCross => "Cross",
+            Self::Diagonals => "Diagonals",
+            Self::None => "None",
+        }
+    }
+}
+
 pub fn hit_test_crop(
     cursor: Point<Pixels>,
     img_dest: Bounds<Pixels>,
@@ -114,6 +137,7 @@ pub struct Viewport {
     pub frame: bool,
     pub crop: Option<CropRect>,
     pub crop_mode: bool,
+    pub crop_guide: CropGuide,
     /// Receives the canvas bounds each paint so input handlers can anchor zoom to
     /// the cursor without re-deriving the layout.
     pub bounds_out: Option<Rc<Cell<Option<Bounds<Pixels>>>>>,
@@ -132,6 +156,7 @@ impl Default for Viewport {
             frame: true,
             crop: None,
             crop_mode: false,
+            crop_guide: CropGuide::default(),
             bounds_out: None,
             image_dest_out: None,
         }
@@ -149,6 +174,7 @@ impl Viewport {
         let draw_frame = self.frame;
         let crop_opt = self.crop;
         let crop_mode = self.crop_mode;
+        let crop_guide = self.crop_guide;
         let bounds_out = self.bounds_out;
         let image_dest_out = self.image_dest_out;
 
@@ -329,37 +355,110 @@ impl Viewport {
                                 border_color,
                             ));
 
-                            // Rule-of-thirds grid
+                            // Composition Guides
                             let grid_color = rgba(0xff_ff_ff_50);
                             let grid_line = px(1.0);
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(px(cx), px(cy + ch / 3.0)),
-                                    size: size(px(cw), grid_line),
-                                },
-                                grid_color,
-                            ));
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(px(cx), px(cy + 2.0 * ch / 3.0)),
-                                    size: size(px(cw), grid_line),
-                                },
-                                grid_color,
-                            ));
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(px(cx + cw / 3.0), px(cy)),
-                                    size: size(grid_line, px(ch)),
-                                },
-                                grid_color,
-                            ));
-                            window.paint_quad(fill(
-                                Bounds {
-                                    origin: point(px(cx + 2.0 * cw / 3.0), px(cy)),
-                                    size: size(grid_line, px(ch)),
-                                },
-                                grid_color,
-                            ));
+                            match crop_guide {
+                                CropGuide::RuleOfThirds => {
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx), px(cy + ch / 3.0)),
+                                            size: size(px(cw), grid_line),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx), px(cy + 2.0 * ch / 3.0)),
+                                            size: size(px(cw), grid_line),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx + cw / 3.0), px(cy)),
+                                            size: size(grid_line, px(ch)),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx + 2.0 * cw / 3.0), px(cy)),
+                                            size: size(grid_line, px(ch)),
+                                        },
+                                        grid_color,
+                                    ));
+                                }
+                                CropGuide::GoldenRatio => {
+                                    let g1 = 0.381966;
+                                    let g2 = 0.618034;
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx), px(cy + ch * g1)),
+                                            size: size(px(cw), grid_line),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx), px(cy + ch * g2)),
+                                            size: size(px(cw), grid_line),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx + cw * g1), px(cy)),
+                                            size: size(grid_line, px(ch)),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx + cw * g2), px(cy)),
+                                            size: size(grid_line, px(ch)),
+                                        },
+                                        grid_color,
+                                    ));
+                                }
+                                CropGuide::CenterCross => {
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx), px(cy + ch * 0.5)),
+                                            size: size(px(cw), grid_line),
+                                        },
+                                        grid_color,
+                                    ));
+                                    window.paint_quad(fill(
+                                        Bounds {
+                                            origin: point(px(cx + cw * 0.5), px(cy)),
+                                            size: size(grid_line, px(ch)),
+                                        },
+                                        grid_color,
+                                    ));
+                                }
+                                CropGuide::Diagonals => {
+                                    let steps = (cw.hypot(ch) / 3.0).max(2.0) as usize;
+                                    for i in 0..=steps {
+                                        let t = i as f32 / steps as f32;
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(cx + cw * t), px(cy + ch * t)),
+                                                size: size(grid_line, grid_line),
+                                            },
+                                            grid_color,
+                                        ));
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(cx + cw * (1.0 - t)), px(cy + ch * t)),
+                                                size: size(grid_line, grid_line),
+                                            },
+                                            grid_color,
+                                        ));
+                                    }
+                                }
+                                CropGuide::None => {}
+                            }
 
                             // 8 Handles
                             let handle_sz = 8.0;

@@ -36,8 +36,209 @@ pub struct ColorAdjustments {
     pub vignette: f32,
     /// 1-click negative color inversion
     pub invert: bool,
+    /// Spline tone curves for composite and individual RGB channels
+    pub curves: Curves,
+    /// Parametric red-eye removal spots (normalized coordinates)
+    pub red_eye_fixes: Vec<RedEyeFix>,
     /// Color filter preset
     pub filter_preset: FilterPreset,
+}
+
+/// A single red-eye removal spot in normalized [0.0, 1.0] image coordinates.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RedEyeFix {
+    pub x: f32,
+    pub y: f32,
+    /// Radius normalized to image height (e.g. 0.02 for ~2% of height).
+    pub radius: f32,
+}
+
+/// A 2D control point for a tone curve, normalized to [0.0, 1.0].
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CurvePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl CurvePoint {
+    pub fn new(x: f32, y: f32) -> Self {
+        Self {
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+        }
+    }
+}
+
+/// A natural cubic spline tone curve defined by sorted control points.
+/// Uses Fritsch-Carlson monotone cubic spline interpolation to eliminate overshoot/ringing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToneCurve {
+    pub points: Vec<CurvePoint>,
+}
+
+impl Default for ToneCurve {
+    fn default() -> Self {
+        Self {
+            points: vec![
+                CurvePoint { x: 0.0, y: 0.0 },
+                CurvePoint { x: 1.0, y: 1.0 },
+            ],
+        }
+    }
+}
+
+impl ToneCurve {
+    pub fn new(mut points: Vec<CurvePoint>) -> Self {
+        if points.is_empty() {
+            return Self::default();
+        }
+        points.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+        if points.first().map(|p| p.x > 0.0).unwrap_or(false) {
+            points.insert(0, CurvePoint { x: 0.0, y: points[0].y });
+        }
+        if points.last().map(|p| p.x < 1.0).unwrap_or(false) {
+            let last_y = points.last().unwrap().y;
+            points.push(CurvePoint { x: 1.0, y: last_y });
+        }
+        Self { points }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        if self.points.len() == 2 {
+            (self.points[0].x - 0.0).abs() < 1e-4
+                && (self.points[0].y - 0.0).abs() < 1e-4
+                && (self.points[1].x - 1.0).abs() < 1e-4
+                && (self.points[1].y - 1.0).abs() < 1e-4
+        } else {
+            self.points.iter().all(|p| (p.x - p.y).abs() < 1e-4)
+        }
+    }
+
+    /// Evaluates the curve at normalized x in [0.0, 1.0] using Fritsch-Carlson
+    /// monotone cubic spline interpolation.
+    pub fn evaluate(&self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        let n = self.points.len();
+        if n == 0 {
+            return x;
+        }
+        if n == 1 {
+            return self.points[0].y;
+        }
+        if x <= self.points[0].x {
+            return self.points[0].y;
+        }
+        if x >= self.points[n - 1].x {
+            return self.points[n - 1].y;
+        }
+
+        // 1. Calculate secants (delta)
+        let mut delta = Vec::with_capacity(n - 1);
+        for i in 0..n - 1 {
+            let h = self.points[i + 1].x - self.points[i].x;
+            if h <= 1e-6 {
+                delta.push(0.0);
+            } else {
+                delta.push((self.points[i + 1].y - self.points[i].y) / h);
+            }
+        }
+
+        // 2. Initialize tangents (d)
+        let mut d = vec![0.0; n];
+        d[0] = delta[0];
+        for i in 1..n - 1 {
+            if delta[i - 1] * delta[i] <= 0.0 {
+                d[i] = 0.0;
+            } else {
+                d[i] = (delta[i - 1] + delta[i]) * 0.5;
+            }
+        }
+        d[n - 1] = delta[n - 2];
+
+        // 3. Fritsch-Carlson monotonicity condition
+        for i in 0..n - 1 {
+            if delta[i] == 0.0 {
+                d[i] = 0.0;
+                d[i + 1] = 0.0;
+            } else {
+                let alpha = d[i] / delta[i];
+                let beta = d[i + 1] / delta[i];
+                let hyp = alpha.hypot(beta);
+                if hyp > 3.0 {
+                    let tau = 3.0 / hyp;
+                    d[i] = tau * alpha * delta[i];
+                    d[i + 1] = tau * beta * delta[i];
+                }
+            }
+        }
+
+        // 4. Find interval containing x
+        let mut idx = 0;
+        for i in 0..n - 1 {
+            if x >= self.points[i].x && x <= self.points[i + 1].x {
+                idx = i;
+                break;
+            }
+        }
+
+        let h = self.points[idx + 1].x - self.points[idx].x;
+        if h <= 1e-6 {
+            return self.points[idx].y;
+        }
+        let t = (x - self.points[idx].x) / h;
+        let t2 = t * t;
+        let t3 = t2 * t;
+
+        // Hermite basis functions
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+
+        let y = h00 * self.points[idx].y
+            + h10 * h * d[idx]
+            + h01 * self.points[idx + 1].y
+            + h11 * h * d[idx + 1];
+
+        y.clamp(0.0, 1.0)
+    }
+
+    /// Build a 1024-entry lookup table for fast pixel processing.
+    pub fn build_lut(&self) -> [f32; 1024] {
+        let mut lut = [0.0f32; 1024];
+        for i in 0..1024 {
+            let x = i as f32 / 1023.0;
+            lut[i] = self.evaluate(x);
+        }
+        lut
+    }
+}
+
+/// Tone curves for Composite RGB, Red, Green, and Blue channels.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+pub struct Curves {
+    pub composite: ToneCurve,
+    pub red: ToneCurve,
+    pub green: ToneCurve,
+    pub blue: ToneCurve,
+}
+
+impl Curves {
+    pub fn is_identity(&self) -> bool {
+        self.composite.is_identity()
+            && self.red.is_identity()
+            && self.green.is_identity()
+            && self.blue.is_identity()
+    }
+
+    pub fn build_luts(&self) -> ([f32; 1024], [f32; 1024], [f32; 1024], [f32; 1024]) {
+        (
+            self.composite.build_lut(),
+            self.red.build_lut(),
+            self.green.build_lut(),
+            self.blue.build_lut(),
+        )
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -90,6 +291,8 @@ impl Default for ColorAdjustments {
             color_level: [0.0, 0.0, 0.0],
             vignette: 0.0,
             invert: false,
+            curves: Curves::default(),
+            red_eye_fixes: Vec::new(),
             filter_preset: FilterPreset::None,
         }
     }
@@ -110,6 +313,8 @@ impl ColorAdjustments {
             && self.color_level == [0.0, 0.0, 0.0]
             && self.vignette == 0.0
             && !self.invert
+            && self.curves.is_identity()
+            && self.red_eye_fixes.is_empty()
             && self.filter_preset == FilterPreset::None
     }
 }
@@ -266,6 +471,13 @@ pub fn apply_color_adjustments(buffer: &mut PixelBuffer<f32>, adj: &ColorAdjustm
     let g_tint = 1.0 - adj.tint * 0.15;
     let hue_matrix = hue_rotation_matrix(adj.hue * 360.0);
     let hue_active = adj.hue != 0.0;
+
+    let curves_active = !adj.curves.is_identity();
+    let (lut_c, lut_r, lut_g, lut_b) = if curves_active {
+        adj.curves.build_luts()
+    } else {
+        ([0.0; 1024], [0.0; 1024], [0.0; 1024], [0.0; 1024])
+    };
 
     buffer
         .data
@@ -448,6 +660,30 @@ pub fn apply_color_adjustments(buffer: &mut PixelBuffer<f32>, adj: &ColorAdjustm
                 b = 1.0 - b;
             }
 
+            // 12. Spline Tone Curves
+            if curves_active {
+                if !adj.curves.red.is_identity() {
+                    let idx = (r.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    r = lut_r[idx];
+                }
+                if !adj.curves.green.is_identity() {
+                    let idx = (g.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    g = lut_g[idx];
+                }
+                if !adj.curves.blue.is_identity() {
+                    let idx = (b.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    b = lut_b[idx];
+                }
+                if !adj.curves.composite.is_identity() {
+                    let idx_r = (r.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    let idx_g = (g.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    let idx_b = (b.clamp(0.0, 1.0) * 1023.0).round() as usize;
+                    r = lut_c[idx_r];
+                    g = lut_c[idx_g];
+                    b = lut_c[idx_b];
+                }
+            }
+
             pixel[0] = r.clamp(0.0, 1.0);
             pixel[1] = g.clamp(0.0, 1.0);
             pixel[2] = b.clamp(0.0, 1.0);
@@ -489,6 +725,73 @@ pub fn apply_color_adjustments(buffer: &mut PixelBuffer<f32>, adj: &ColorAdjustm
                     row[px_idx + 2] = (row[px_idx + 2] * factor).clamp(0.0, 1.0);
                 }
             });
+    }
+
+    // 13. Red-Eye Removal Fixes
+    if !adj.red_eye_fixes.is_empty() {
+        for fix in &adj.red_eye_fixes {
+            apply_red_eye_fix_to_buffer(buffer, *fix);
+        }
+    }
+}
+
+/// Apply a single red-eye removal fix directly to an f32 PixelBuffer.
+/// Implements Pix/GIMP red pupil neutralization: R' = (G * GREEN_FACTOR + B * BLUE_FACTOR) / (2.0 * RED_FACTOR)
+/// with smooth radial edge feathering.
+pub fn apply_red_eye_fix_to_buffer(buffer: &mut PixelBuffer<f32>, fix: RedEyeFix) {
+    if fix.radius <= 0.0 {
+        return;
+    }
+    const RED_FACTOR: f32 = 0.5133333;
+    const GREEN_FACTOR: f32 = 1.0;
+    const BLUE_FACTOR: f32 = 0.1933333;
+
+    let width = buffer.width;
+    let height = buffer.height;
+
+    let cx = fix.x * width as f32;
+    let cy = fix.y * height as f32;
+    let radius = (fix.radius * height as f32).max(1.0);
+
+    let min_x = ((cx - radius).floor() as i32).max(0) as u32;
+    let max_x = ((cx + radius).ceil() as i32).min(width as i32 - 1) as u32;
+    let min_y = ((cy - radius).floor() as i32).max(0) as u32;
+    let max_y = ((cy + radius).ceil() as i32).min(height as i32 - 1) as u32;
+
+    let r_sq = radius * radius;
+    let inner_r = radius * 0.65;
+    let inner_r_sq = inner_r * inner_r;
+
+    for y in min_y..=max_y {
+        let dy = y as f32 - cy;
+        let dy_sq = dy * dy;
+        for x in min_x..=max_x {
+            let dx = x as f32 - cx;
+            let d_sq = dx * dx + dy_sq;
+            if d_sq > r_sq {
+                continue;
+            }
+
+            let idx = ((y * width + x) * 4) as usize;
+            let r = buffer.data[idx];
+            let g = buffer.data[idx + 1];
+            let b = buffer.data[idx + 2];
+
+            let ad_red = r * RED_FACTOR;
+            let ad_green = g * GREEN_FACTOR;
+            let ad_blue = b * BLUE_FACTOR;
+
+            if ad_red >= ad_green && ad_red >= ad_blue {
+                let target_r = ((ad_green + ad_blue) / (2.0 * RED_FACTOR)).clamp(0.0, 1.0);
+                let factor = if d_sq <= inner_r_sq {
+                    1.0
+                } else {
+                    let d = d_sq.sqrt();
+                    1.0 - ((d - inner_r) / (radius - inner_r)).clamp(0.0, 1.0)
+                };
+                buffer.data[idx] = r * (1.0 - factor) + target_r * factor;
+            }
+        }
     }
 }
 

@@ -675,3 +675,65 @@ fn test_apply_exif_orientation_matches_the_dihedral_map() {
     let unchanged = apply_exif_orientation(&src, 1);
     assert_eq!(unchanged.data, src.data);
 }
+
+#[test]
+fn test_tone_curve_identity_and_evaluation() {
+    use nodapix_imaging::{CurvePoint, ToneCurve};
+
+    let curve = ToneCurve::default();
+    assert!(curve.is_identity());
+    assert_eq!(curve.evaluate(0.0), 0.0);
+    assert_eq!(curve.evaluate(0.5), 0.5);
+    assert_eq!(curve.evaluate(1.0), 1.0);
+
+    // Custom S-curve
+    let s_curve = ToneCurve::new(vec![
+        CurvePoint::new(0.0, 0.0),
+        CurvePoint::new(0.25, 0.15),
+        CurvePoint::new(0.75, 0.85),
+        CurvePoint::new(1.0, 1.0),
+    ]);
+    assert!(!s_curve.is_identity());
+    assert!(s_curve.evaluate(0.25) < 0.25);
+    assert!(s_curve.evaluate(0.75) > 0.75);
+
+    // Check monotonicity across 100 sample points
+    let mut prev = -1.0;
+    for i in 0..=100 {
+        let x = i as f32 / 100.0;
+        let y = s_curve.evaluate(x);
+        assert!(y >= prev, "Monotonicity violated at x={x}: y={y} < prev={prev}");
+        assert!(y >= 0.0 && y <= 1.0, "Clamping violated at x={x}: y={y}");
+        prev = y;
+    }
+}
+
+#[test]
+fn test_red_eye_removal_neutralization() {
+    use nodapix_imaging::{apply_red_eye_fix_to_buffer, PixelBuffer, RedEyeFix};
+
+    let mut buf = PixelBuffer::<f32>::new(50, 50);
+    // Fill with neutral background
+    buf.data.fill(0.3);
+
+    // Create an intense flash pupil reflection at center (25, 25): bright red (R=0.9, G=0.1, B=0.1)
+    buf.set_pixel(25, 25, [0.9, 0.1, 0.1, 1.0]);
+
+    let fix = RedEyeFix {
+        x: 0.5,
+        y: 0.5,
+        radius: 0.1, // 5 pixels on 50x50 image
+    };
+
+    apply_red_eye_fix_to_buffer(&mut buf, fix);
+
+    let fixed_px = buf.get_pixel(25, 25);
+    assert!(
+        fixed_px[0] < 0.3,
+        "Red channel should be neutralized down to iris tone: got {}",
+        fixed_px[0]
+    );
+    // Green and blue channels should be preserved
+    assert_eq!(fixed_px[1], 0.1);
+    assert_eq!(fixed_px[2], 0.1);
+}

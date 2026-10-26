@@ -50,8 +50,10 @@ pub enum ToolGroup {
     BrightnessContrast,
     ColorBalance,
     Levels,
+    Curves,
     HueSaturation,
     Sharpen,
+    RedEye,
     Vignette,
     Straighten,
 }

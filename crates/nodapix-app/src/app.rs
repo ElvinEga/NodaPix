@@ -16,8 +16,9 @@ use gpui::{
 use nodapix_core::{execute_pipeline, render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
     attach_exif, calculate_auto_levels, calculate_white_balance_from_sample, compute_histogram,
-    resize, CropRatioPreset, CropRect, ExportFormat, ExportOptions, FilterPreset, ImageBackend,
-    ImageHistogram, ImageMetadata, NativeBackend, PixelBuffer, TEMPERATURE_NEUTRAL_KELVIN,
+    resize, CropRatioPreset, CropRect, CurvePoint, Curves, ExportFormat, ExportOptions,
+    FilterPreset, ImageBackend, ImageHistogram, ImageMetadata, NativeBackend, PixelBuffer,
+    RedEyeFix, ToneCurve, TEMPERATURE_NEUTRAL_KELVIN,
 };
 
 use crate::actions::{
@@ -27,7 +28,7 @@ use crate::actions::{
     ZoomIn, ZoomOut,
 };
 use crate::canvas::{
-    fit_scale, hit_test_crop, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
+    fit_scale, hit_test_crop, CropGuide, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
 };
 use crate::icon::LucideIcon;
 use crate::panel::{
@@ -88,6 +89,26 @@ fn format_file_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum CurveChannel {
+    #[default]
+    Composite,
+    Red,
+    Green,
+    Blue,
+}
+
+impl CurveChannel {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Composite => "RGB",
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+        }
     }
 }
 
@@ -206,6 +227,18 @@ pub struct Editor {
     eyedropper_active: bool,
     eyedropper_sample: Option<([u8; 4], String, Point<Pixels>)>,
 
+    // Crop composition guide
+    crop_guide: CropGuide,
+
+    // Red-eye removal tool state
+    redeye_radius: f32,
+    redeye_hover: Option<Point<Pixels>>,
+
+    // Spline tone curves state
+    curve_channel: CurveChannel,
+    curve_drag_idx: Option<usize>,
+    curve_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
 }
@@ -235,6 +268,7 @@ impl Editor {
             crop_portrait: false,
             crop_drag: None,
             crop_multiple_of: None,
+            crop_guide: CropGuide::RuleOfThirds,
             export_settings: ExportSettings::default(),
             resize_settings: ResizeSettings::default(),
             folder_images: Vec::new(),
@@ -252,6 +286,11 @@ impl Editor {
             horizon_current: None,
             eyedropper_active: false,
             eyedropper_sample: None,
+            redeye_radius: 20.0,
+            redeye_hover: None,
+            curve_channel: CurveChannel::Composite,
+            curve_drag_idx: None,
+            curve_canvas_bounds: Rc::new(Cell::new(None)),
             window_title: "NodaPix".into(),
         }
     }
@@ -1109,6 +1148,32 @@ impl Editor {
             return;
         }
 
+        if self.active_tool_group == Some(ToolGroup::RedEye) {
+            if let Some(dest) = self.image_dest.get() {
+                let bx = f32::from(dest.origin.x);
+                let by = f32::from(dest.origin.y);
+                let bw = f32::from(dest.size.width);
+                let bh = f32::from(dest.size.height);
+                let mx = f32::from(event.position.x);
+                let my = f32::from(event.position.y);
+                if mx >= bx && mx < bx + bw && my >= by && my < by + bh && bw > 0.0 && bh > 0.0 {
+                    let nx = (mx - bx) / bw;
+                    let ny = (my - by) / bh;
+                    let norm_r = (self.redeye_radius / bh).clamp(0.005, 0.25);
+                    self.edit(cx, move |state| {
+                        state.color.red_eye_fixes.push(RedEyeFix {
+                            x: nx,
+                            y: ny,
+                            radius: norm_r,
+                        });
+                    });
+                    self.status = "Red-eye fix applied".into();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
         if self.crop_mode {
             if let (Some(dest), Some(crop)) = (self.image_dest.get(), self.draft_crop) {
                 if let Some(handle) = hit_test_crop(event.position, dest, crop) {
@@ -1159,6 +1224,61 @@ impl Editor {
         if self.horizon_mode {
             if self.horizon_start.is_some() {
                 self.horizon_current = Some(event.position);
+                cx.notify();
+                return;
+            }
+        }
+
+        if self.active_tool_group == Some(ToolGroup::RedEye) {
+            if let Some(dest) = self.image_dest.get() {
+                let bx = f32::from(dest.origin.x);
+                let by = f32::from(dest.origin.y);
+                let bw = f32::from(dest.size.width);
+                let bh = f32::from(dest.size.height);
+                let mx = f32::from(event.position.x);
+                let my = f32::from(event.position.y);
+                if mx >= bx && mx < bx + bw && my >= by && my < by + bh {
+                    self.redeye_hover = Some(event.position);
+                } else {
+                    self.redeye_hover = None;
+                }
+                cx.notify();
+            }
+        }
+
+        if let Some(idx) = self.curve_drag_idx {
+            if let Some(b) = self.curve_canvas_bounds.get() {
+                let cw = f32::from(b.size.width);
+                let ch = f32::from(b.size.height);
+                let ox = f32::from(b.origin.x);
+                let oy = f32::from(b.origin.y);
+                let mx = f32::from(event.position.x);
+                let my = f32::from(event.position.y);
+
+                let nx = ((mx - ox) / cw).clamp(0.0, 1.0);
+                let ny = (1.0 - (my - oy) / ch).clamp(0.0, 1.0);
+
+                let channel = self.curve_channel;
+                self.edit(cx, move |state| {
+                    let curve = match channel {
+                        CurveChannel::Composite => &mut state.color.curves.composite,
+                        CurveChannel::Red => &mut state.color.curves.red,
+                        CurveChannel::Green => &mut state.color.curves.green,
+                        CurveChannel::Blue => &mut state.color.curves.blue,
+                    };
+                    if idx < curve.points.len() {
+                        if idx == 0 {
+                            curve.points[0].y = ny;
+                        } else if idx == curve.points.len() - 1 {
+                            curve.points[idx].y = ny;
+                        } else {
+                            let min_x = curve.points[idx - 1].x + 0.01;
+                            let max_x = curve.points[idx + 1].x - 0.01;
+                            curve.points[idx].x = nx.clamp(min_x, max_x);
+                            curve.points[idx].y = ny;
+                        }
+                    }
+                });
                 cx.notify();
                 return;
             }
@@ -1365,6 +1485,7 @@ impl Editor {
 
         self.crop_drag = None;
         self.drag_origin = None;
+        self.curve_drag_idx = None;
         cx.notify();
     }
 
@@ -1995,6 +2116,51 @@ impl Editor {
                                                     .child(format!("{} px", multiple_of.unwrap_or(8))),
                                             ),
                                     ),
+                            )
+                            // Composition Guide
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .pt_1()
+                                    .border_t_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Composition Guide:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children([
+                                                CropGuide::RuleOfThirds,
+                                                CropGuide::GoldenRatio,
+                                                CropGuide::CenterCross,
+                                                CropGuide::Diagonals,
+                                                CropGuide::None,
+                                            ].iter().map(|&guide| {
+                                                let is_sel = guide == self.crop_guide;
+                                                div()
+                                                    .px_2()
+                                                    .py(px(3.0))
+                                                    .text_xs()
+                                                    .rounded_sm()
+                                                    .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                                    .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                        this.crop_guide = guide;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(guide.label())
+                                            }))
+                                    ),
                             ),
                     )
                     // Apply & Cancel buttons
@@ -2180,7 +2346,7 @@ impl Editor {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    // Row 1: Brightness/Contrast, Color Balance, Levels, Equalize
+                                    // Row 1: Light, Balance, Levels, Curves
                                     .child(
                                         div()
                                             .flex()
@@ -2213,15 +2379,16 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                LucideIcon::Contrast,
-                                                "Equalize",
+                                                LucideIcon::Spline,
+                                                "Curves",
                                                 false,
-                                                cx.listener(|this, _, window, cx| {
-                                                    this.auto_enhance(&AutoEnhance, window, cx);
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = Some(ToolGroup::Curves);
+                                                    cx.notify();
                                                 }),
                                             )),
                                     )
-                                    // Row 2: Curves/Hue, Auto Enhance, Sharpen, Vignette
+                                    // Row 2: Hue/Sat, Red Eye, Sharpen, Vignette & Filters
                                     .child(
                                         div()
                                             .flex()
@@ -2236,11 +2403,12 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                LucideIcon::Wand2,
-                                                "Auto",
+                                                LucideIcon::Eye,
+                                                "Red Eye",
                                                 false,
-                                                cx.listener(|this, _, window, cx| {
-                                                    this.auto_enhance(&AutoEnhance, window, cx);
+                                                cx.listener(|this, _, _, cx| {
+                                                    this.active_tool_group = Some(ToolGroup::RedEye);
+                                                    cx.notify();
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
@@ -2253,12 +2421,34 @@ impl Editor {
                                                 }),
                                             ))
                                             .child(self.render_grid_tool_btn(
-                                                LucideIcon::Eye,
+                                                LucideIcon::Film,
                                                 "Vignette",
                                                 false,
                                                 cx.listener(|this, _, _, cx| {
                                                     this.active_tool_group = Some(ToolGroup::Vignette);
                                                     cx.notify();
+                                                }),
+                                            )),
+                                    )
+                                    // Row 3: Auto Enhance & Equalize
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap_1()
+                                            .child(self.render_grid_tool_btn(
+                                                LucideIcon::Wand2,
+                                                "Auto",
+                                                false,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.auto_enhance(&AutoEnhance, window, cx);
+                                                }),
+                                            ))
+                                            .child(self.render_grid_tool_btn(
+                                                LucideIcon::Contrast,
+                                                "Equalize",
+                                                false,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.auto_enhance(&AutoEnhance, window, cx);
                                                 }),
                                             )),
                                     ),
@@ -2439,9 +2629,11 @@ impl Editor {
             ToolGroup::BrightnessContrast => ("Light & Contrast", LucideIcon::Sun, true),
             ToolGroup::ColorBalance => ("Color Balance", LucideIcon::Palette, true),
             ToolGroup::Levels => ("Levels & Exposure", LucideIcon::Sliders, true),
+            ToolGroup::Curves => ("Tone Curves", LucideIcon::Spline, false),
             ToolGroup::HueSaturation => ("Hue & Saturation", LucideIcon::Activity, false),
             ToolGroup::Sharpen => ("Sharpen", LucideIcon::Zap, false),
-            ToolGroup::Vignette => ("Vignette & Filters", LucideIcon::Eye, false),
+            ToolGroup::RedEye => ("Red-Eye Removal", LucideIcon::Eye, false),
+            ToolGroup::Vignette => ("Vignette & Filters", LucideIcon::Film, false),
             ToolGroup::Straighten => ("Straighten & Rotate", LucideIcon::SlidersHorizontal, false),
         };
 
@@ -2523,12 +2715,18 @@ impl Editor {
                                         state.color.highlights = 0.0;
                                         state.color.shadows = 0.0;
                                     }),
+                                    ToolGroup::Curves => this.edit(cx, |state| {
+                                        state.color.curves = Curves::default();
+                                    }),
                                     ToolGroup::HueSaturation => this.edit(cx, |state| {
                                         state.color.saturation = 0.0;
                                         state.color.hue = 0.0;
                                     }),
                                     ToolGroup::Sharpen => this.edit(cx, |state| {
                                         state.sharpness = 0.0;
+                                    }),
+                                    ToolGroup::RedEye => this.edit(cx, |state| {
+                                        state.color.red_eye_fixes.clear();
                                     }),
                                     ToolGroup::Vignette => this.edit(cx, |state| {
                                         state.color.vignette = 0.0;
@@ -2667,6 +2865,434 @@ impl Editor {
                                     bounds.clone(),
                                 ))
                             })
+                            .when(group == ToolGroup::Curves, |el| {
+                                let current_channel = self.curve_channel;
+                                let active_curve = match current_channel {
+                                    CurveChannel::Composite => &state.color.curves.composite,
+                                    CurveChannel::Red => &state.color.curves.red,
+                                    CurveChannel::Green => &state.color.curves.green,
+                                    CurveChannel::Blue => &state.color.curves.blue,
+                                };
+                                let (curve_col, curve_hex) = match current_channel {
+                                    CurveChannel::Composite => (rgb(0xf3_f4_f6), 0xf3_f4_f6),
+                                    CurveChannel::Red => (rgb(0xef_44_44), 0xef_44_44),
+                                    CurveChannel::Green => (rgb(0x22_c5_5e), 0x22_c5_5e),
+                                    CurveChannel::Blue => (rgb(0x3b_82_f6), 0x3b_82_f6),
+                                };
+
+                                let curve_clone = active_curve.clone();
+                                let hist_clone = self.histogram.clone();
+                                let points_clone = active_curve.points.clone();
+                                let cb_cell = self.curve_canvas_bounds.clone();
+
+                                el.child(
+                                    // Channel Tabs
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .p_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x22_22_2a))
+                                        .border_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .children([
+                                            CurveChannel::Composite,
+                                            CurveChannel::Red,
+                                            CurveChannel::Green,
+                                            CurveChannel::Blue,
+                                        ].iter().map(|&ch| {
+                                            let is_sel = ch == current_channel;
+                                            let ch_badge_color = match ch {
+                                                CurveChannel::Composite => rgb(0xf3_f4_f6),
+                                                CurveChannel::Red => rgb(0xef_44_44),
+                                                CurveChannel::Green => rgb(0x22_c5_5e),
+                                                CurveChannel::Blue => rgb(0x3b_82_f6),
+                                            };
+                                            div()
+                                                .flex_1()
+                                                .py(px(3.0))
+                                                .text_center()
+                                                .text_xs()
+                                                .font_weight(if is_sel { gpui::FontWeight::BOLD } else { gpui::FontWeight::NORMAL })
+                                                .rounded_sm()
+                                                .bg(if is_sel { rgb(0x32_32_3e) } else { rgb(0x22_22_2a) })
+                                                .text_color(if is_sel { ch_badge_color } else { rgb(TEXT_MUTED) })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                    this.curve_channel = ch;
+                                                    this.curve_drag_idx = None;
+                                                    cx.notify();
+                                                }))
+                                                .child(ch.label())
+                                        }))
+                                )
+                                // Curve Canvas Box
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(190.0))
+                                        .rounded_md()
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .relative()
+                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            if let Some(b) = this.curve_canvas_bounds.get() {
+                                                let cw = f32::from(b.size.width);
+                                                let ch = f32::from(b.size.height);
+                                                let ox = f32::from(b.origin.x);
+                                                let oy = f32::from(b.origin.y);
+                                                let mx = f32::from(event.position.x);
+                                                let my = f32::from(event.position.y);
+
+                                                if mx >= ox && mx <= ox + cw && my >= oy && my <= oy + ch && cw > 0.0 && ch > 0.0 {
+                                                    let nx = ((mx - ox) / cw).clamp(0.0, 1.0);
+                                                    let ny = (1.0 - (my - oy) / ch).clamp(0.0, 1.0);
+
+                                                    let mut hit_idx = None;
+                                                    let channel = this.curve_channel;
+                                                    this.edit(cx, |state| {
+                                                        let curve = match channel {
+                                                            CurveChannel::Composite => &mut state.color.curves.composite,
+                                                            CurveChannel::Red => &mut state.color.curves.red,
+                                                            CurveChannel::Green => &mut state.color.curves.green,
+                                                            CurveChannel::Blue => &mut state.color.curves.blue,
+                                                        };
+                                                        for (i, p) in curve.points.iter().enumerate() {
+                                                            let px = ox + p.x * cw;
+                                                            let py = oy + ch * (1.0 - p.y);
+                                                            if (mx - px).hypot(my - py) < 14.0 {
+                                                                hit_idx = Some(i);
+                                                                break;
+                                                            }
+                                                        }
+                                                        if hit_idx.is_none() {
+                                                            curve.points.push(CurvePoint::new(nx, ny));
+                                                            curve.points.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal));
+                                                            hit_idx = curve.points.iter().position(|p| (p.x - nx).abs() < 1e-4 && (p.y - ny).abs() < 1e-4);
+                                                        }
+                                                    });
+                                                    this.curve_drag_idx = hit_idx;
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }))
+                                        .on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            if let Some(b) = this.curve_canvas_bounds.get() {
+                                                let cw = f32::from(b.size.width);
+                                                let ch = f32::from(b.size.height);
+                                                let ox = f32::from(b.origin.x);
+                                                let oy = f32::from(b.origin.y);
+                                                let mx = f32::from(event.position.x);
+                                                let my = f32::from(event.position.y);
+
+                                                let channel = this.curve_channel;
+                                                this.edit(cx, |state| {
+                                                    let curve = match channel {
+                                                        CurveChannel::Composite => &mut state.color.curves.composite,
+                                                        CurveChannel::Red => &mut state.color.curves.red,
+                                                        CurveChannel::Green => &mut state.color.curves.green,
+                                                        CurveChannel::Blue => &mut state.color.curves.blue,
+                                                    };
+                                                    if curve.points.len() > 2 {
+                                                        let mut remove_idx = None;
+                                                        for i in 1..curve.points.len() - 1 {
+                                                            let p = &curve.points[i];
+                                                            let px = ox + p.x * cw;
+                                                            let py = oy + ch * (1.0 - p.y);
+                                                            if (mx - px).hypot(my - py) < 14.0 {
+                                                                remove_idx = Some(i);
+                                                                break;
+                                                            }
+                                                        }
+                                                        if let Some(i) = remove_idx {
+                                                            curve.points.remove(i);
+                                                        }
+                                                    }
+                                                });
+                                                this.curve_drag_idx = None;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(canvas(
+                                            move |_, _, _| {},
+                                            move |bounds, _, window, _| {
+                                                cb_cell.set(Some(bounds));
+                                                let cw = f32::from(bounds.size.width);
+                                                let ch = f32::from(bounds.size.height);
+                                                let ox = f32::from(bounds.origin.x);
+                                                let oy = f32::from(bounds.origin.y);
+
+                                                window.paint_quad(fill(bounds, rgb(0x14_14_18)));
+
+                                                // Grid lines
+                                                let grid_col = rgba(0xff_ff_ff_15);
+                                                for frac in [0.25, 0.50, 0.75] {
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin: point(px(ox), px(oy + ch * (1.0 - frac))),
+                                                            size: size(px(cw), px(1.0)),
+                                                        },
+                                                        grid_col,
+                                                    ));
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin: point(px(ox + cw * frac), px(oy)),
+                                                            size: size(px(1.0), px(ch)),
+                                                        },
+                                                        grid_col,
+                                                    ));
+                                                }
+
+                                                // Diagonal
+                                                let diag_col = rgba(0xff_ff_ff_25);
+                                                for i in 0..25 {
+                                                    let t = i as f32 / 24.0;
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin: point(px(ox + cw * t), px(oy + ch * (1.0 - t))),
+                                                            size: size(px(2.0), px(2.0)),
+                                                        },
+                                                        diag_col,
+                                                    ));
+                                                }
+
+                                                // Live Histogram Backdrop
+                                                if let Some(h) = &hist_clone {
+                                                    let hist_data = match current_channel {
+                                                        CurveChannel::Composite => &h.luma,
+                                                        CurveChannel::Red => &h.r,
+                                                        CurveChannel::Green => &h.g,
+                                                        CurveChannel::Blue => &h.b,
+                                                    };
+                                                    if h.max_count > 0 {
+                                                        let max_c = h.max_count as f32;
+                                                        let bar_col = rgba((curve_hex << 8) | 0x30);
+                                                        for i in 0..256 {
+                                                            let count = hist_data[i] as f32;
+                                                            let bar_h = (count / max_c * (ch * 0.75)).min(ch);
+                                                            if bar_h > 1.0 {
+                                                                let bx = ox + (i as f32 / 255.0) * cw;
+                                                                let by = oy + ch - bar_h;
+                                                                window.paint_quad(fill(
+                                                                    Bounds {
+                                                                        origin: point(px(bx), px(by)),
+                                                                        size: size(px((cw / 256.0).max(1.0)), px(bar_h)),
+                                                                    },
+                                                                    bar_col,
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // Spline Curve
+                                                let steps = (cw as usize).max(60);
+                                                let mut prev_x = ox;
+                                                let mut prev_y = oy + ch * (1.0 - curve_clone.evaluate(0.0));
+                                                for i in 1..=steps {
+                                                    let nx = i as f32 / steps as f32;
+                                                    let ny = curve_clone.evaluate(nx);
+                                                    let cur_x = ox + nx * cw;
+                                                    let cur_y = oy + ch * (1.0 - ny);
+
+                                                    let d = (cur_x - prev_x).hypot(cur_y - prev_y);
+                                                    let sub = (d / 2.0).max(1.0) as usize;
+                                                    for s in 0..=sub {
+                                                        let st = s as f32 / sub as f32;
+                                                        let sx = prev_x + (cur_x - prev_x) * st;
+                                                        let sy = prev_y + (cur_y - prev_y) * st;
+                                                        window.paint_quad(fill(
+                                                            Bounds {
+                                                                origin: point(px(sx - 0.75), px(sy - 0.75)),
+                                                                size: size(px(1.5), px(1.5)),
+                                                            },
+                                                            curve_col,
+                                                        ));
+                                                    }
+                                                    prev_x = cur_x;
+                                                    prev_y = cur_y;
+                                                }
+
+                                                // Control Points
+                                                for pt in &points_clone {
+                                                    let ptx = ox + pt.x * cw;
+                                                    let pty = oy + ch * (1.0 - pt.y);
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin: point(px(ptx - 4.5), px(pty - 4.5)),
+                                                            size: size(px(9.0), px(9.0)),
+                                                        },
+                                                        curve_col,
+                                                    ));
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin: point(px(ptx - 2.5), px(pty - 2.5)),
+                                                            size: size(px(5.0), px(5.0)),
+                                                        },
+                                                        rgb(0xff_ff_ff),
+                                                    ));
+                                                }
+                                            },
+                                        ))
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("Click canvas to add point. Right-click to remove point.")
+                                )
+                                // Quick Curve Presets
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .pt_1()
+                                        .border_t_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .child(div().text_xs().font_weight(gpui::FontWeight::BOLD).text_color(rgb(TEXT_PRIMARY)).child("Curve Presets"))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_wrap()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x2a_2a_33))
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            let ch = this.curve_channel;
+                                                            this.edit(cx, move |state| {
+                                                                let c = match ch {
+                                                                    CurveChannel::Composite => &mut state.color.curves.composite,
+                                                                    CurveChannel::Red => &mut state.color.curves.red,
+                                                                    CurveChannel::Green => &mut state.color.curves.green,
+                                                                    CurveChannel::Blue => &mut state.color.curves.blue,
+                                                                };
+                                                                *c = ToneCurve::default();
+                                                            });
+                                                        }))
+                                                        .child("Linear (Reset)"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x2a_2a_33))
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            let ch = this.curve_channel;
+                                                            this.edit(cx, move |state| {
+                                                                let c = match ch {
+                                                                    CurveChannel::Composite => &mut state.color.curves.composite,
+                                                                    CurveChannel::Red => &mut state.color.curves.red,
+                                                                    CurveChannel::Green => &mut state.color.curves.green,
+                                                                    CurveChannel::Blue => &mut state.color.curves.blue,
+                                                                };
+                                                                *c = ToneCurve::new(vec![
+                                                                    CurvePoint::new(0.0, 0.0),
+                                                                    CurvePoint::new(0.25, 0.18),
+                                                                    CurvePoint::new(0.75, 0.82),
+                                                                    CurvePoint::new(1.0, 1.0),
+                                                                ]);
+                                                            });
+                                                        }))
+                                                        .child("Medium Contrast"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x2a_2a_33))
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            let ch = this.curve_channel;
+                                                            this.edit(cx, move |state| {
+                                                                let c = match ch {
+                                                                    CurveChannel::Composite => &mut state.color.curves.composite,
+                                                                    CurveChannel::Red => &mut state.color.curves.red,
+                                                                    CurveChannel::Green => &mut state.color.curves.green,
+                                                                    CurveChannel::Blue => &mut state.color.curves.blue,
+                                                                };
+                                                                *c = ToneCurve::new(vec![
+                                                                    CurvePoint::new(0.0, 0.0),
+                                                                    CurvePoint::new(0.25, 0.10),
+                                                                    CurvePoint::new(0.75, 0.90),
+                                                                    CurvePoint::new(1.0, 1.0),
+                                                                ]);
+                                                            });
+                                                        }))
+                                                        .child("Hard Contrast"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x2a_2a_33))
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            let ch = this.curve_channel;
+                                                            this.edit(cx, move |state| {
+                                                                let c = match ch {
+                                                                    CurveChannel::Composite => &mut state.color.curves.composite,
+                                                                    CurveChannel::Red => &mut state.color.curves.red,
+                                                                    CurveChannel::Green => &mut state.color.curves.green,
+                                                                    CurveChannel::Blue => &mut state.color.curves.blue,
+                                                                };
+                                                                *c = ToneCurve::new(vec![
+                                                                    CurvePoint::new(0.0, 0.0),
+                                                                    CurvePoint::new(0.50, 0.65),
+                                                                    CurvePoint::new(1.0, 1.0),
+                                                                ]);
+                                                            });
+                                                        }))
+                                                        .child("Lighter"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py(px(3.0))
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(rgb(0x2a_2a_33))
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            let ch = this.curve_channel;
+                                                            this.edit(cx, move |state| {
+                                                                let c = match ch {
+                                                                    CurveChannel::Composite => &mut state.color.curves.composite,
+                                                                    CurveChannel::Red => &mut state.color.curves.red,
+                                                                    CurveChannel::Green => &mut state.color.curves.green,
+                                                                    CurveChannel::Blue => &mut state.color.curves.blue,
+                                                                };
+                                                                *c = ToneCurve::new(vec![
+                                                                    CurvePoint::new(0.0, 0.0),
+                                                                    CurvePoint::new(0.50, 0.35),
+                                                                    CurvePoint::new(1.0, 1.0),
+                                                                ]);
+                                                            });
+                                                        }))
+                                                        .child("Darker"),
+                                                )
+                                        )
+                                )
+                            })
                             .when(group == ToolGroup::HueSaturation, |el| {
                                 el.child(render_slider_row(
                                     SliderSpec::SATURATION,
@@ -2685,6 +3311,108 @@ impl Editor {
                                     SliderSpec::SHARPNESS.get_value(state),
                                     bounds.clone(),
                                 ))
+                            })
+                            .when(group == ToolGroup::RedEye, |el| {
+                                let fixes_count = state.color.red_eye_fixes.len();
+                                let current_radius = self.redeye_radius;
+
+                                el.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(TEXT_MUTED))
+                                        .child("Click on red flash reflections in the pupil on the image to neutralize red glare.")
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .justify_between()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child("Pupil Brush Radius:")
+                                                .child(format!("{:.0} px", current_radius)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .children([12.0, 18.0, 24.0, 32.0, 48.0].iter().map(|&r| {
+                                                    let is_sel = (r - current_radius).abs() < 1.0;
+                                                    div()
+                                                        .flex_1()
+                                                        .py(px(4.0))
+                                                        .text_center()
+                                                        .text_xs()
+                                                        .rounded_sm()
+                                                        .bg(if is_sel { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                                        .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            this.redeye_radius = r;
+                                                            cx.notify();
+                                                        }))
+                                                        .child(format!("{:.0}px", r))
+                                                }))
+                                        )
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt_2()
+                                        .border_t_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child(format!("Fixes applied: {}", fixes_count)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap_1()
+                                                .when(fixes_count > 0, |buttons| {
+                                                    buttons.child(
+                                                        div()
+                                                            .px_2()
+                                                            .py(px(3.0))
+                                                            .text_xs()
+                                                            .rounded_sm()
+                                                            .bg(rgb(0x2a_2a_33))
+                                                            .text_color(rgb(TEXT_PRIMARY))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                                this.edit(cx, |state| {
+                                                                    state.color.red_eye_fixes.pop();
+                                                                });
+                                                            }))
+                                                            .child("Undo Last"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .px_2()
+                                                            .py(px(3.0))
+                                                            .text_xs()
+                                                            .rounded_sm()
+                                                            .bg(rgb(0x2a_2a_33))
+                                                            .text_color(rgb(TEXT_PRIMARY))
+                                                            .cursor(CursorStyle::PointingHand)
+                                                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                                this.edit(cx, |state| {
+                                                                    state.color.red_eye_fixes.clear();
+                                                                });
+                                                            }))
+                                                            .child("Clear All"),
+                                                    )
+                                                }),
+                                        )
+                                )
                             })
                             .when(group == ToolGroup::Vignette, |el| {
                                 el.child(
@@ -3891,6 +4619,7 @@ impl Render for Editor {
             frame: self.document.is_some(),
             crop: self.draft_crop,
             crop_mode: self.crop_mode,
+            crop_guide: self.crop_guide,
             bounds_out: Some(self.bounds.clone()),
             image_dest_out: Some(self.image_dest.clone()),
         };
@@ -3947,6 +4676,7 @@ impl Render for Editor {
             ];
             let active_preset = self.crop_preset;
             let is_portrait = self.crop_portrait;
+            let active_guide = self.crop_guide;
 
             root = root.child(
                 div()
@@ -4079,7 +4809,37 @@ impl Render for Editor {
                                         this.toggle_crop_orientation(cx);
                                     }))
                                     .child(if is_portrait { "Orientation: Vertical ↕" } else { "Orientation: Horizontal ↔" }),
-                            ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .ml_3()
+                                    .mr_1()
+                                    .child("Guide:"),
+                            )
+                            .children([
+                                CropGuide::RuleOfThirds,
+                                CropGuide::GoldenRatio,
+                                CropGuide::CenterCross,
+                                CropGuide::Diagonals,
+                                CropGuide::None,
+                            ].iter().map(|&g| {
+                                let is_sel = g == active_guide;
+                                div()
+                                    .px_2()
+                                    .py(px(2.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if is_sel { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if is_sel { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                        this.crop_guide = g;
+                                        cx.notify();
+                                    }))
+                                    .child(g.label())
+                            })),
                     ),
             );
         } else {
@@ -4318,7 +5078,7 @@ impl Render for Editor {
                         .flex_1()
                         .relative()
                         .overflow_hidden()
-                        .cursor(if self.crop_mode || self.horizon_mode || self.eyedropper_active { CursorStyle::Crosshair } else { CursorStyle::OpenHand })
+                        .cursor(if self.crop_mode || self.horizon_mode || self.eyedropper_active || self.active_tool_group == Some(ToolGroup::RedEye) { CursorStyle::Crosshair } else { CursorStyle::OpenHand })
                         .on_scroll(cx.listener(Self::on_scroll))
                         .on_pinch(cx.listener(Self::on_pinch))
                         .on_drop(cx.listener(Self::on_drop))
@@ -4529,6 +5289,53 @@ impl Render for Editor {
                                                     .child(format!("RGB: {}, {}, {}", r, g, b)),
                                             ),
                                     ),
+                            );
+                        }
+                    }
+
+                    // Floating target loupe when Red-Eye tool is active
+                    if self.active_tool_group == Some(ToolGroup::RedEye) {
+                        if let Some(pos) = self.redeye_hover {
+                            let hx = f32::from(pos.x);
+                            let hy = f32::from(pos.y);
+                            let r = self.redeye_radius;
+                            canvas_container = canvas_container.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .child(canvas(
+                                        move |_, _, _| {},
+                                        move |_, _, window, _| {
+                                            let steps = 36;
+                                            for i in 0..steps {
+                                                let a = i as f32 * std::f32::consts::TAU / steps as f32;
+                                                let px_x = hx + r * a.cos();
+                                                let px_y = hy + r * a.sin();
+                                                window.paint_quad(fill(
+                                                    Bounds {
+                                                        origin: point(px(px_x - 1.0), px(px_y - 1.0)),
+                                                        size: size(px(2.0), px(2.0)),
+                                                    },
+                                                    rgb(0xef_44_44),
+                                                ));
+                                            }
+                                            // Center crosshairs
+                                            window.paint_quad(fill(
+                                                Bounds {
+                                                    origin: point(px(hx - 5.0), px(hy - 0.5)),
+                                                    size: size(px(10.0), px(1.0)),
+                                                },
+                                                rgb(0xef_44_44),
+                                            ));
+                                            window.paint_quad(fill(
+                                                Bounds {
+                                                    origin: point(px(hx - 0.5), px(hy - 5.0)),
+                                                    size: size(px(1.0), px(10.0)),
+                                                },
+                                                rgb(0xef_44_44),
+                                            ));
+                                        },
+                                    )),
                             );
                         }
                     }
