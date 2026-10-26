@@ -24,8 +24,11 @@ use nodapix_imaging::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs,
-    ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
-    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    ToggleBatchConvert, ToggleBatchRename, ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo,
+    ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+};
+use crate::batch::{
+    evaluate_rename_template, BatchConvertSettings, BatchRenameSettings, CaseTransform,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropGuide, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
@@ -246,6 +249,10 @@ pub struct Editor {
     slideshow_running: bool,
     slideshow_interval_secs: u64,
 
+    // Batch operations state
+    batch_convert: BatchConvertSettings,
+    batch_rename: BatchRenameSettings,
+
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
 }
@@ -303,6 +310,8 @@ impl Editor {
             presentation_hud_gen: 0,
             slideshow_running: false,
             slideshow_interval_secs: 3,
+            batch_convert: BatchConvertSettings::default(),
+            batch_rename: BatchRenameSettings::default(),
             window_title: "NodaPix".into(),
         }
     }
@@ -658,6 +667,216 @@ impl Editor {
         .detach();
     }
 
+    pub fn toggle_batch_convert(
+        &mut self,
+        _: &ToggleBatchConvert,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folder_images.is_empty() {
+            self.status = "No images found in current folder to convert".into();
+            cx.notify();
+            return;
+        }
+        let default_dest = self
+            .document
+            .as_ref()
+            .and_then(|d| d.file_path.as_ref())
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        self.batch_convert.destination_folder = default_dest;
+        self.batch_convert.total_count = self.folder_images.len();
+        self.batch_convert.current_index = 0;
+        self.batch_convert.is_running = false;
+        self.batch_convert.completed = false;
+        self.batch_convert.status_message =
+            format!("Ready to convert {} image(s)", self.folder_images.len());
+        self.batch_convert.is_open = !self.batch_convert.is_open;
+        cx.notify();
+    }
+
+    pub fn execute_batch_convert(&mut self, cx: &mut Context<Self>) {
+        if self.batch_convert.is_running || self.folder_images.is_empty() {
+            return;
+        }
+
+        let dest_dir = match &self.batch_convert.destination_folder {
+            Some(d) => d.clone(),
+            None => {
+                self.batch_convert.status_message = "Please select a destination folder".into();
+                cx.notify();
+                return;
+            }
+        };
+
+        if !dest_dir.exists() {
+            let _ = std::fs::create_dir_all(&dest_dir);
+        }
+
+        let images = self.folder_images.clone();
+        let format = self.batch_convert.format;
+        let quality = self.batch_convert.quality;
+        let total = images.len();
+
+        self.batch_convert.is_running = true;
+        self.batch_convert.completed = false;
+        self.batch_convert.current_index = 0;
+        self.batch_convert.total_count = total;
+        self.batch_convert.status_message = format!("Converting 1/{}...", total);
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let mut converted = 0;
+            let mut errors = 0;
+
+            for (idx, src_path) in images.iter().enumerate() {
+                let p = src_path.clone();
+                let dest = dest_dir.clone();
+                let stem = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let current_filename = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let target_path = dest.join(format!("{}.{}", stem, format.extension()));
+
+                let outcome = executor
+                    .spawn(async move {
+                        let buf = NativeBackend::new()
+                            .decode_from_path(&p)
+                            .map_err(|e| e.to_string())?;
+                        let exif = ImageMetadata::read_exif_block_from_path(&p);
+                        let bytes = NativeBackend::new()
+                            .encode_to_bytes(&buf, &ExportOptions { format, quality })
+                            .map_err(|e| e.to_string())?;
+                        let with_exif_bytes = with_exif(bytes, format, exif.as_deref());
+                        write_atomically(&with_exif_bytes, &target_path)?;
+                        Ok::<(), String>(())
+                    })
+                    .await;
+
+                if outcome.is_ok() {
+                    converted += 1;
+                } else {
+                    errors += 1;
+                }
+                let _ = this.update(cx, |editor, cx| {
+                    editor.batch_convert.current_index = idx + 1;
+                    editor.batch_convert.current_filename = current_filename;
+                    editor.batch_convert.status_message =
+                        format!("Converting {}/{}...", idx + 1, total);
+                    cx.notify();
+                });
+            }
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.batch_convert.is_running = false;
+                editor.batch_convert.completed = true;
+                editor.batch_convert.status_message = if errors == 0 {
+                    format!(
+                        "Successfully converted all {} image(s) to {:?}!",
+                        converted, format
+                    )
+                } else {
+                    format!("Converted {} image(s) ({} failed)", converted, errors)
+                };
+                editor.status = editor.batch_convert.status_message.clone().into();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_batch_rename(
+        &mut self,
+        _: &ToggleBatchRename,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folder_images.is_empty() {
+            self.status = "No images found in current folder to rename".into();
+            cx.notify();
+            return;
+        }
+        self.batch_rename.is_running = false;
+        self.batch_rename.completed = false;
+        self.batch_rename.status_message =
+            format!("Ready to rename {} image(s)", self.folder_images.len());
+        self.batch_rename.is_open = !self.batch_rename.is_open;
+        cx.notify();
+    }
+
+    pub fn execute_batch_rename(&mut self, cx: &mut Context<Self>) {
+        if self.batch_rename.is_running || self.folder_images.is_empty() {
+            return;
+        }
+
+        let images = self.folder_images.clone();
+        let template = self.batch_rename.template.clone();
+        let start_at = self.batch_rename.start_at;
+        let case_mode = self.batch_rename.case_mode;
+        let total = images.len();
+
+        self.batch_rename.is_running = true;
+        self.batch_rename.completed = false;
+        cx.notify();
+
+        let mut renamed_count = 0;
+        let mut errors = 0;
+        let mut new_paths = Vec::with_capacity(total);
+
+        // Precompute planned new paths
+        for (i, p) in images.iter().enumerate() {
+            let num = start_at + i;
+            let meta_date = ImageMetadata::read_from_path(p).and_then(|m| m.date_time);
+            let new_filename =
+                evaluate_rename_template(&template, num, p, meta_date.as_deref(), case_mode);
+            let target_path = p
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&new_filename);
+            new_paths.push((p.clone(), target_path));
+        }
+
+        // Execute renaming
+        for (src, dst) in &new_paths {
+            if src == dst {
+                renamed_count += 1;
+                continue;
+            }
+            if std::fs::rename(src, dst).is_ok() {
+                renamed_count += 1;
+            } else {
+                errors += 1;
+            }
+        }
+
+        self.batch_rename.is_running = false;
+        self.batch_rename.completed = true;
+        self.batch_rename.status_message = if errors == 0 {
+            format!("Successfully renamed {} file(s)!", renamed_count)
+        } else {
+            format!("Renamed {} file(s) ({} failed)", renamed_count, errors)
+        };
+        self.status = self.batch_rename.status_message.clone().into();
+
+        // Reload current image if its path changed
+        let cur_path = self.document.as_ref().and_then(|d| d.file_path.clone());
+        if let Some(current_path) = cur_path {
+            let reloaded_path = new_paths
+                .iter()
+                .find(|(src, _)| src == &current_path)
+                .map(|(_, dst)| dst.clone())
+                .unwrap_or(current_path);
+            self.load(reloaded_path, cx);
+        }
+        cx.notify();
+    }
+
     // ------------------------------------------------------------------ editing
 
     fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut EditState)) {
@@ -808,6 +1027,16 @@ impl Editor {
             if window.is_fullscreen() {
                 window.toggle_fullscreen();
             }
+            cx.notify();
+            return;
+        }
+        if self.batch_convert.is_open {
+            self.batch_convert.is_open = false;
+            cx.notify();
+            return;
+        }
+        if self.batch_rename.is_open {
+            self.batch_rename.is_open = false;
             cx.notify();
             return;
         }
@@ -4847,6 +5076,780 @@ impl Editor {
             )
     }
 
+    fn render_batch_convert_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let total = self.batch_convert.total_count;
+        let current_fmt = self.batch_convert.format;
+        let current_quality = self.batch_convert.quality;
+        let dest_str = self
+            .batch_convert
+            .destination_folder
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "Same directory as source".to_string());
+        let is_running = self.batch_convert.is_running;
+        let completed = self.batch_convert.completed;
+        let progress = if total > 0 {
+            (self.batch_convert.current_index as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(520.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Scaling.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Batch Convert Format"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{total} file(s) selected")),
+                            ),
+                    )
+                    // Format selection
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(MUTED)).child("Target Format:"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .children(
+                                        [
+                                            ExportFormat::Jpeg,
+                                            ExportFormat::Png,
+                                            ExportFormat::WebP,
+                                            ExportFormat::Tiff,
+                                        ]
+                                        .into_iter()
+                                        .map(|fmt| {
+                                            let is_sel = fmt == current_fmt;
+                                            div()
+                                                .px_3()
+                                                .py(px(4.0))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .bg(if is_sel {
+                                                    rgb(ACCENT)
+                                                } else {
+                                                    rgb(0x2e_2e_38)
+                                                })
+                                                .text_color(if is_sel {
+                                                    rgb(0xff_ff_ff)
+                                                } else {
+                                                    rgb(TEXT_PRIMARY)
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.batch_convert.format = fmt;
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(match fmt {
+                                                    ExportFormat::Jpeg => "JPEG",
+                                                    ExportFormat::Png => "PNG",
+                                                    ExportFormat::WebP => "WebP",
+                                                    ExportFormat::Tiff => "TIFF",
+                                                })
+                                        }),
+                                    ),
+                            ),
+                    )
+                    // Quality slider for JPEG / WebP
+                    .when(
+                        matches!(current_fmt, ExportFormat::Jpeg | ExportFormat::WebP),
+                        |parent| {
+                            parent.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .justify_between()
+                                            .text_xs()
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(MUTED))
+                                                    .child("Compression Quality:"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .child(format!("{current_quality}%")),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .w(px(24.0))
+                                                    .h(px(24.0))
+                                                    .rounded_md()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            if this.batch_convert.quality > 10 {
+                                                                this.batch_convert.quality -= 5;
+                                                                cx.notify();
+                                                            }
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        LucideIcon::Minus
+                                                            .element(12.0, rgb(TEXT_PRIMARY)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .h(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .child(
+                                                        div()
+                                                            .h_full()
+                                                            .w(gpui::relative(
+                                                                current_quality as f32 / 100.0,
+                                                            ))
+                                                            .rounded_full()
+                                                            .bg(rgb(ACCENT)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .w(px(24.0))
+                                                    .h(px(24.0))
+                                                    .rounded_md()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            if this.batch_convert.quality < 100 {
+                                                                this.batch_convert.quality += 5;
+                                                                cx.notify();
+                                                            }
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        LucideIcon::Plus
+                                                            .element(12.0, rgb(TEXT_PRIMARY)),
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                        },
+                    )
+                    // Destination directory
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Destination Folder:"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(0x1a_1a_20))
+                                            .border_1()
+                                            .border_color(rgb(BORDER_COLOR))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .overflow_hidden()
+                                            .child(dest_str),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .bg(rgb(0x2e_2e_38))
+                                            .text_xs()
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .cursor(CursorStyle::PointingHand)
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, _, cx| {
+                                                    if let Some(folder) =
+                                                        rfd::FileDialog::new().pick_folder()
+                                                    {
+                                                        this.batch_convert.destination_folder =
+                                                            Some(folder);
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            )
+                                            .child(
+                                                LucideIcon::FolderOpen
+                                                    .element(12.0, rgb(TEXT_PRIMARY)),
+                                            )
+                                            .child("Choose…"),
+                                    ),
+                            ),
+                    )
+                    // Progress & Status bar
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .h(px(8.0))
+                                    .rounded_full()
+                                    .bg(rgb(0x1a_1a_20))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(gpui::relative(progress))
+                                            .rounded_full()
+                                            .bg(if completed {
+                                                rgb(0x22_c5_5e)
+                                            } else {
+                                                rgb(ACCENT)
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if completed {
+                                        rgb(0x22_c5_5e)
+                                    } else {
+                                        rgb(MUTED)
+                                    })
+                                    .child(self.batch_convert.status_message.clone()),
+                            ),
+                    )
+                    // Footer actions
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x2e_2e_38))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.batch_convert.is_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if completed { "Done" } else { "Cancel" }),
+                            )
+                            .when(!completed, |parent| {
+                                parent.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_4()
+                                        .py(px(6.0))
+                                        .rounded_md()
+                                        .bg(if is_running {
+                                            rgb(0x4a_4a_56)
+                                        } else {
+                                            rgb(ACCENT)
+                                        })
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .cursor(if is_running {
+                                            CursorStyle::Arrow
+                                        } else {
+                                            CursorStyle::PointingHand
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.execute_batch_convert(cx);
+                                            }),
+                                        )
+                                        .child(LucideIcon::Check.element(13.0, rgb(0xff_ff_ff)))
+                                        .child(if is_running {
+                                            "Converting…"
+                                        } else {
+                                            "Start Conversion"
+                                        }),
+                                )
+                            }),
+                    ),
+            )
+    }
+
+    fn render_batch_rename_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let total = self.folder_images.len();
+        let template = self.batch_rename.template.clone();
+        let start_at = self.batch_rename.start_at;
+        let case_mode = self.batch_rename.case_mode;
+        let completed = self.batch_rename.completed;
+        let is_running = self.batch_rename.is_running;
+
+        // Compute preview pairs for top 8 files
+        let preview_pairs: Vec<(String, String)> = self
+            .folder_images
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(i, p)| {
+                let orig = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let num = start_at + i;
+                let new_name = evaluate_rename_template(&template, num, p, None, case_mode);
+                (orig, new_name)
+            })
+            .collect();
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(580.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Wand2.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Batch Rename Series"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{total} file(s) in folder")),
+                            ),
+                    )
+                    // Template preset pills
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Template Pattern:"),
+                            )
+                            .child(
+                                div().flex().items_center().gap_2().child(
+                                    div()
+                                        .flex_1()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(rgb(0x1a_1a_20))
+                                        .border_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .child(template.clone()),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .pt_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .mr_1()
+                                            .child("Presets:"),
+                                    )
+                                    .children(
+                                        [
+                                            ("Photo_###", "Photo_###"),
+                                            ("%F_edit_###", "%F_edit_###"),
+                                            ("%Y%m%d_###", "%Y%m%d_###"),
+                                            ("Img_%04d", "Img_%04d"),
+                                            ("Pic_#", "Pic_#"),
+                                        ]
+                                        .iter()
+                                        .map(|&(label, pat)| {
+                                            let is_sel = template == pat;
+                                            div()
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .bg(if is_sel {
+                                                    rgb(ACCENT)
+                                                } else {
+                                                    rgb(0x2e_2e_38)
+                                                })
+                                                .text_color(if is_sel {
+                                                    rgb(0xff_ff_ff)
+                                                } else {
+                                                    rgb(TEXT_PRIMARY)
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.batch_rename.template =
+                                                            pat.to_string();
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(label)
+                                        }),
+                                    ),
+                            ),
+                    )
+                    // Start number & Case options
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div().text_xs().text_color(rgb(MUTED)).child("Start At:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .w(px(22.0))
+                                                    .h(px(22.0))
+                                                    .rounded_md()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            if this.batch_rename.start_at > 1 {
+                                                                this.batch_rename.start_at -= 1;
+                                                                cx.notify();
+                                                            }
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        LucideIcon::Minus
+                                                            .element(11.0, rgb(TEXT_PRIMARY)),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(32.0))
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .child(format!("{start_at}")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .w(px(22.0))
+                                                    .h(px(22.0))
+                                                    .rounded_md()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.batch_rename.start_at += 1;
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        LucideIcon::Plus
+                                                            .element(11.0, rgb(TEXT_PRIMARY)),
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .mr_1()
+                                            .child("Case:"),
+                                    )
+                                    .children(
+                                        [
+                                            CaseTransform::Preserve,
+                                            CaseTransform::Lowercase,
+                                            CaseTransform::Uppercase,
+                                        ]
+                                        .into_iter()
+                                        .map(|c| {
+                                            let is_sel = c == case_mode;
+                                            div()
+                                                .px_2()
+                                                .py(px(2.0))
+                                                .rounded_md()
+                                                .text_xs()
+                                                .bg(if is_sel {
+                                                    rgb(ACCENT)
+                                                } else {
+                                                    rgb(0x2e_2e_38)
+                                                })
+                                                .text_color(if is_sel {
+                                                    rgb(0xff_ff_ff)
+                                                } else {
+                                                    rgb(TEXT_PRIMARY)
+                                                })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.batch_rename.case_mode = c;
+                                                        cx.notify();
+                                                    }),
+                                                )
+                                                .child(c.label())
+                                        }),
+                                    ),
+                            ),
+                    )
+                    // Live Preview Table
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_between()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child("Original Name")
+                                    .child("Renamed Preview"),
+                            )
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x1a_1a_20))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .children(preview_pairs.into_iter().map(|(orig, new_name)| {
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .text_xs()
+                                            .child(div().text_color(rgb(MUTED)).child(orig))
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .child(new_name),
+                                            )
+                                    })),
+                            ),
+                    )
+                    // Status message
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if completed {
+                                rgb(0x22_c5_5e)
+                            } else {
+                                rgb(MUTED)
+                            })
+                            .child(self.batch_rename.status_message.clone()),
+                    )
+                    // Footer actions
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x2e_2e_38))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.batch_rename.is_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if completed { "Done" } else { "Cancel" }),
+                            )
+                            .when(!completed, |parent| {
+                                parent.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_4()
+                                        .py(px(6.0))
+                                        .rounded_md()
+                                        .bg(if is_running {
+                                            rgb(0x4a_4a_56)
+                                        } else {
+                                            rgb(ACCENT)
+                                        })
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .cursor(if is_running {
+                                            CursorStyle::Arrow
+                                        } else {
+                                            CursorStyle::PointingHand
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.execute_batch_rename(cx);
+                                            }),
+                                        )
+                                        .child(LucideIcon::Check.element(13.0, rgb(0xff_ff_ff)))
+                                        .child(if is_running {
+                                            "Renaming…".to_string()
+                                        } else {
+                                            format!("Rename All ({total})")
+                                        }),
+                                )
+                            }),
+                    ),
+            )
+    }
+
     fn status_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let zoom_text = format!("{:.0}%", self.scale() * 100.0);
         let mode = if self.compare { "Original" } else { "Edited" };
@@ -4991,7 +5994,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_thumbnail_pane))
             .on_action(cx.listener(Self::toggle_resize))
             .on_action(cx.listener(Self::toggle_fullscreen))
-            .on_action(cx.listener(Self::toggle_slideshow));
+            .on_action(cx.listener(Self::toggle_slideshow))
+            .on_action(cx.listener(Self::toggle_batch_convert))
+            .on_action(cx.listener(Self::toggle_batch_rename));
 
         // Fullscreen presentation view
         if self.presentation_mode {
@@ -5343,6 +6348,42 @@ impl Render for Editor {
                                     }))
                                     .child(LucideIcon::Scaling.element(13.0, rgb(TEXT_PRIMARY)))
                                     .child("Resize…"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if self.batch_convert.is_open { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.batch_convert.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_batch_convert(&ToggleBatchConvert, window, cx);
+                                    }))
+                                    .child(LucideIcon::Scaling.element(13.0, if self.batch_convert.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                    .child("Convert…"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if self.batch_rename.is_open { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.batch_rename.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_batch_rename(&ToggleBatchRename, window, cx);
+                                    }))
+                                    .child(LucideIcon::Wand2.element(13.0, if self.batch_rename.is_open { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                    .child("Rename…"),
                             ),
                     )
                     // Right: View controls & Tools sidebar toggle
@@ -5792,6 +6833,16 @@ impl Render for Editor {
         // EXIF Metadata Inspector Modal overlay if active
         if self.exif_open {
             root = root.child(self.render_exif_modal(cx));
+        }
+
+        // Batch Convert Modal overlay if active
+        if self.batch_convert.is_open {
+            root = root.child(self.render_batch_convert_modal(cx));
+        }
+
+        // Batch Rename Series Modal overlay if active
+        if self.batch_rename.is_open {
+            root = root.child(self.render_batch_rename_modal(cx));
         }
 
         root

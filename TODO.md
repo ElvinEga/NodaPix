@@ -92,15 +92,15 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
 
 ## 4. Batch Operations & File Utilities
 
-- [ ] **Batch Format Converter**
+- [x] **Batch Format Converter**
   - *Pix reference*: [`pix/extensions/convert_format/`](file:///Users/solution/Development/rea/pix/pix/extensions/convert_format/)
-  - *Description*: Multi-file batch format conversion dialog allowing selection of multiple images, destination directory, output format (JPEG, PNG, WebP, TIFF), and quality slider.
-  - *Target*: `crates/nodapix-app/src/app.rs`
+  - *Description*: Multi-file batch format conversion dialog allowing selection of destination directory, output format (JPEG, PNG, WebP, TIFF), compression quality slider, and background conversion progress bar.
+  - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleBatchConvert` action, menu item, toolbar button, background task execution, and EXIF block preservation.
 
-- [ ] **Batch Series Renaming**
+- [x] **Batch Series Renaming**
   - *Pix reference*: [`pix/extensions/rename_series/`](file:///Users/solution/Development/rea/pix/pix/extensions/rename_series/)
-  - *Description*: Pattern-based batch file renamer with token replacement (e.g. `Trip_%04d`, `%Y%m%d_%H%M%S`, original name, counter start/step) with live preview table.
-  - *Target*: `crates/nodapix-app/src/app.rs`
+  - *Description*: Pattern-based batch file renamer with token replacement (e.g. `Trip_###`, `%04d`, `%F` original filename, `%Y%m%d` date, `%E` extension, start counter, case transform) with live preview table.
+  - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleBatchRename` action, menu item, toolbar button, quick token presets, live preview table, and atomic rename.
 
 - [ ] **Batch EXIF Date/Time Adjuster**
   - *Pix reference*: [`pix/extensions/change_date/`](file:///Users/solution/Development/rea/pix/pix/extensions/change_date/)

@@ -36,5 +36,7 @@ actions!(
         ToggleResize,
         ToggleFullscreen,
         ToggleSlideshow,
+        ToggleBatchConvert,
+        ToggleBatchRename,
     ]
 );

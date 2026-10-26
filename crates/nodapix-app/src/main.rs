@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod batch;
 mod canvas;
 mod icon;
 mod panel;
@@ -17,8 +18,9 @@ use gpui::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
-    SaveAs, ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
-    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    SaveAs, ToggleBatchConvert, ToggleBatchRename, ToggleCompare, ToggleCrop, ToggleFullscreen,
+    ToggleInfo, ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn,
+    ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -58,6 +60,8 @@ fn main() {
             KeyBinding::new("f11", ToggleFullscreen, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-ctrl-f", ToggleFullscreen, Some(KEY_CONTEXT)),
             KeyBinding::new("space", ToggleSlideshow, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-shift-c", ToggleBatchConvert, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-shift-r", ToggleBatchRename, Some(KEY_CONTEXT)),
             KeyBinding::new("left", PrevImage, Some(KEY_CONTEXT)),
             KeyBinding::new("right", NextImage, Some(KEY_CONTEXT)),
         ]);
@@ -111,6 +115,10 @@ fn main() {
                 MenuItem::action("Rotate Right", RotateCW),
                 MenuItem::action("Flip Horizontal", FlipH),
                 MenuItem::action("Flip Vertical", FlipV),
+            ]),
+            Menu::new("Tools").items(vec![
+                MenuItem::action("Batch Convert Format…", ToggleBatchConvert),
+                MenuItem::action("Batch Rename Series…", ToggleBatchRename),
             ]),
         ]);
 
