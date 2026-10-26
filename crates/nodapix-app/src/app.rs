@@ -24,11 +24,14 @@ use nodapix_imaging::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs,
-    ToggleBatchConvert, ToggleBatchRename, ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo,
-    ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare, ToggleCrop,
+    ToggleFindDuplicates, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
+    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::batch::{
-    evaluate_rename_template, BatchConvertSettings, BatchRenameSettings, CaseTransform,
+    adjust_date_string, compute_dhash, evaluate_rename_template, hamming_distance,
+    BatchConvertSettings, BatchDateSettings, BatchRenameSettings, CaseTransform, DateAdjustMode,
+    DuplicateFileItem, DuplicateFinderSettings, DuplicateGroup, DuplicateMatchMode,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropGuide, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
@@ -252,6 +255,8 @@ pub struct Editor {
     // Batch operations state
     batch_convert: BatchConvertSettings,
     batch_rename: BatchRenameSettings,
+    batch_date: BatchDateSettings,
+    duplicate_finder: DuplicateFinderSettings,
 
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
@@ -312,6 +317,8 @@ impl Editor {
             slideshow_interval_secs: 3,
             batch_convert: BatchConvertSettings::default(),
             batch_rename: BatchRenameSettings::default(),
+            batch_date: BatchDateSettings::default(),
+            duplicate_finder: DuplicateFinderSettings::default(),
             window_title: "NodaPix".into(),
         }
     }
@@ -877,6 +884,274 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn toggle_batch_date(
+        &mut self,
+        _: &ToggleBatchDate,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folder_images.is_empty() {
+            self.status = "No images found in current folder to adjust dates".into();
+            cx.notify();
+            return;
+        }
+        self.batch_date.is_running = false;
+        self.batch_date.completed = false;
+        self.batch_date.status_message = format!(
+            "Ready to adjust timestamps on {} images",
+            self.folder_images.len()
+        );
+        self.batch_date.is_open = !self.batch_date.is_open;
+        cx.notify();
+    }
+
+    pub fn execute_batch_date(&mut self, cx: &mut Context<Self>) {
+        if self.batch_date.is_running || self.folder_images.is_empty() {
+            return;
+        }
+
+        let images = self.folder_images.clone();
+        let mode = self.batch_date.mode;
+        let offset_secs = (self.batch_date.offset_hours as i64 * 3600)
+            + (self.batch_date.offset_minutes as i64 * 60);
+        let specific_date = self.batch_date.specific_date.clone();
+
+        self.batch_date.is_running = true;
+        self.batch_date.completed = false;
+        cx.notify();
+
+        let mut updated = 0;
+        for p in &images {
+            if let Ok(bytes) = std::fs::read(p) {
+                let mut modified = bytes.clone();
+                let orig_date = ImageMetadata::read_from_path(p).and_then(|m| m.date_time);
+                let new_date = match mode {
+                    DateAdjustMode::Offset => {
+                        if let Some(ref od) = orig_date {
+                            adjust_date_string(od, offset_secs)
+                        } else {
+                            adjust_date_string("2026:01:01 12:00:00", offset_secs)
+                        }
+                    }
+                    DateAdjustMode::SetSpecific => Some(specific_date.clone()),
+                };
+
+                if let Some(target_date) = new_date {
+                    let target_bytes = target_date.as_bytes();
+                    // Search for 19-byte ASCII date pattern: "YYYY:MM:DD HH:MM:SS"
+                    let mut found = false;
+                    if let Some(ref od) = orig_date {
+                        let od_bytes = od.as_bytes();
+                        if let Some(pos) =
+                            modified.windows(od_bytes.len()).position(|w| w == od_bytes)
+                        {
+                            if pos + target_bytes.len() <= modified.len() {
+                                modified[pos..pos + target_bytes.len()]
+                                    .copy_from_slice(target_bytes);
+                                found = true;
+                            }
+                        }
+                    }
+                    if found {
+                        let _ = write_atomically(&modified, p);
+                        updated += 1;
+                    }
+                }
+            }
+        }
+
+        self.batch_date.is_running = false;
+        self.batch_date.completed = true;
+        self.batch_date.status_message = format!("Updated timestamps on {} image(s)!", updated);
+        self.status = self.batch_date.status_message.clone().into();
+
+        // Refresh metadata of current image if loaded
+        if let Some(doc) = &self.document {
+            if let Some(ref cp) = doc.file_path {
+                self.metadata = ImageMetadata::read_from_path(cp);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_find_duplicates(
+        &mut self,
+        _: &ToggleFindDuplicates,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.folder_images.is_empty() {
+            self.status = "No images found in current folder to scan for duplicates".into();
+            cx.notify();
+            return;
+        }
+        self.duplicate_finder.is_scanning = false;
+        self.duplicate_finder.progress_msg = String::new();
+        self.duplicate_finder.status_message = format!(
+            "Found {} images in folder. Click 'Scan Folder' to begin.",
+            self.folder_images.len()
+        );
+        self.duplicate_finder.is_open = !self.duplicate_finder.is_open;
+        cx.notify();
+    }
+
+    pub fn execute_find_duplicates(&mut self, cx: &mut Context<Self>) {
+        if self.duplicate_finder.is_scanning || self.folder_images.is_empty() {
+            return;
+        }
+
+        let images = self.folder_images.clone();
+        let match_mode = self.duplicate_finder.match_mode;
+        let total = images.len();
+
+        self.duplicate_finder.is_scanning = true;
+        self.duplicate_finder.groups.clear();
+        self.duplicate_finder.progress_msg = format!("Computing hashes (0/{total})…");
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let mut items = Vec::new();
+
+            for (idx, p) in images.iter().enumerate() {
+                let p_clone = p.clone();
+                let item = executor
+                    .spawn(async move {
+                        let size_bytes = std::fs::metadata(&p_clone).map(|m| m.len()).unwrap_or(0);
+                        let filename = p_clone
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if let Ok(buf) = NativeBackend::new().decode_from_path(&p_clone) {
+                            let dhash = compute_dhash(&buf);
+                            Some(DuplicateFileItem {
+                                path: p_clone,
+                                filename,
+                                size_bytes,
+                                width: buf.width,
+                                height: buf.height,
+                                dhash,
+                                selected_for_removal: false,
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .await;
+
+                if let Some(it) = item {
+                    items.push(it);
+                }
+
+                let _ = this.update(cx, |editor, cx| {
+                    editor.duplicate_finder.progress_msg =
+                        format!("Scanning images ({}/{})…", idx + 1, total);
+                    cx.notify();
+                });
+            }
+
+            // Cluster into duplicate groups
+            let mut matched_indices = std::collections::HashSet::new();
+            let mut groups = Vec::new();
+            let mut group_id = 1;
+
+            for i in 0..items.len() {
+                if matched_indices.contains(&i) {
+                    continue;
+                }
+                let mut current_group = vec![items[i].clone()];
+
+                for j in (i + 1)..items.len() {
+                    if matched_indices.contains(&j) {
+                        continue;
+                    }
+                    let is_match = match match_mode {
+                        DuplicateMatchMode::Visual => {
+                            hamming_distance(items[i].dhash, items[j].dhash) <= 5
+                        }
+                        DuplicateMatchMode::Exact => {
+                            items[i].size_bytes == items[j].size_bytes
+                                && items[i].dhash == items[j].dhash
+                        }
+                    };
+                    if is_match {
+                        let mut duplicate_item = items[j].clone();
+                        duplicate_item.selected_for_removal = true; // Auto-select duplicate copy for removal
+                        current_group.push(duplicate_item);
+                        matched_indices.insert(j);
+                    }
+                }
+
+                if current_group.len() > 1 {
+                    matched_indices.insert(i);
+                    groups.push(DuplicateGroup {
+                        group_id,
+                        items: current_group,
+                    });
+                    group_id += 1;
+                }
+            }
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.duplicate_finder.is_scanning = false;
+                let dup_count: usize =
+                    groups.iter().map(|g| g.items.len().saturating_sub(1)).sum();
+                editor.duplicate_finder.status_message = if groups.is_empty() {
+                    "No duplicate photos found.".to_string()
+                } else {
+                    format!(
+                        "Found {} duplicate groups ({} duplicate files total)",
+                        groups.len(),
+                        dup_count
+                    )
+                };
+                editor.duplicate_finder.groups = groups;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub fn delete_selected_duplicates(&mut self, cx: &mut Context<Self>) {
+        let mut deleted_count = 0;
+        let mut paths_to_delete = Vec::new();
+
+        for group in &self.duplicate_finder.groups {
+            for item in &group.items {
+                if item.selected_for_removal {
+                    paths_to_delete.push(item.path.clone());
+                }
+            }
+        }
+
+        for path in &paths_to_delete {
+            if std::fs::remove_file(path).is_ok() {
+                deleted_count += 1;
+            }
+        }
+
+        self.duplicate_finder.groups.retain_mut(|group| {
+            group
+                .items
+                .retain(|item| !paths_to_delete.contains(&item.path));
+            group.items.len() > 1
+        });
+
+        self.duplicate_finder.status_message = format!(
+            "Deleted {} duplicate file(s) successfully.",
+            deleted_count
+        );
+        self.status = self.duplicate_finder.status_message.clone().into();
+
+        // Refresh folder scan
+        let cur_path = self.document.as_ref().and_then(|d| d.file_path.clone());
+        if let Some(ref current_path) = cur_path {
+            self.scan_folder(current_path, cx);
+        }
+        cx.notify();
+    }
+
     // ------------------------------------------------------------------ editing
 
     fn edit(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut EditState)) {
@@ -1037,6 +1312,16 @@ impl Editor {
         }
         if self.batch_rename.is_open {
             self.batch_rename.is_open = false;
+            cx.notify();
+            return;
+        }
+        if self.batch_date.is_open {
+            self.batch_date.is_open = false;
+            cx.notify();
+            return;
+        }
+        if self.duplicate_finder.is_open {
+            self.duplicate_finder.is_open = false;
             cx.notify();
             return;
         }
@@ -5850,6 +6135,776 @@ impl Editor {
             )
     }
 
+    fn render_batch_date_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let total = self.folder_images.len();
+        let mode = self.batch_date.mode;
+        let offset_h = self.batch_date.offset_hours;
+        let offset_m = self.batch_date.offset_minutes;
+        let completed = self.batch_date.completed;
+        let is_running = self.batch_date.is_running;
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(520.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Activity.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Batch Adjust Date & Time"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{total} file(s) in folder")),
+                            ),
+                    )
+                    // Mode selector tabs
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py(px(4.0))
+                                    .rounded_md()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .bg(if mode == DateAdjustMode::Offset {
+                                        rgb(ACCENT)
+                                    } else {
+                                        rgb(0x2e_2e_38)
+                                    })
+                                    .text_color(if mode == DateAdjustMode::Offset {
+                                        rgb(0xff_ff_ff)
+                                    } else {
+                                        rgb(TEXT_PRIMARY)
+                                    })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.batch_date.mode = DateAdjustMode::Offset;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Time Offset (Timezone / Clock Sync)"),
+                            )
+                            .child(
+                                div()
+                                    .px_3()
+                                    .py(px(4.0))
+                                    .rounded_md()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .bg(if mode == DateAdjustMode::SetSpecific {
+                                        rgb(ACCENT)
+                                    } else {
+                                        rgb(0x2e_2e_38)
+                                    })
+                                    .text_color(if mode == DateAdjustMode::SetSpecific {
+                                        rgb(0xff_ff_ff)
+                                    } else {
+                                        rgb(TEXT_PRIMARY)
+                                    })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.batch_date.mode = DateAdjustMode::SetSpecific;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Set Specific Date"),
+                            ),
+                    )
+                    // Offset controls
+                    .when(mode == DateAdjustMode::Offset, |parent| {
+                        parent.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child("Adjust Hours:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .w(px(24.0))
+                                                        .h(px(24.0))
+                                                        .rounded_md()
+                                                        .bg(rgb(0x2e_2e_38))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.batch_date.offset_hours -= 1;
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            LucideIcon::Minus
+                                                                .element(12.0, rgb(TEXT_PRIMARY)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(48.0))
+                                                        .text_center()
+                                                        .text_sm()
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .child(format!("{:+}", offset_h)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .w(px(24.0))
+                                                        .h(px(24.0))
+                                                        .rounded_md()
+                                                        .bg(rgb(0x2e_2e_38))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.batch_date.offset_hours += 1;
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            LucideIcon::Plus
+                                                                .element(12.0, rgb(TEXT_PRIMARY)),
+                                                        ),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child("Adjust Minutes:"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .w(px(24.0))
+                                                        .h(px(24.0))
+                                                        .rounded_md()
+                                                        .bg(rgb(0x2e_2e_38))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.batch_date.offset_minutes -= 5;
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            LucideIcon::Minus
+                                                                .element(12.0, rgb(TEXT_PRIMARY)),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(48.0))
+                                                        .text_center()
+                                                        .text_sm()
+                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                        .text_color(rgb(TEXT_PRIMARY))
+                                                        .child(format!("{:+}", offset_m)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .w(px(24.0))
+                                                        .h(px(24.0))
+                                                        .rounded_md()
+                                                        .bg(rgb(0x2e_2e_38))
+                                                        .cursor(CursorStyle::PointingHand)
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.batch_date.offset_minutes += 5;
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(
+                                                            LucideIcon::Plus
+                                                                .element(12.0, rgb(TEXT_PRIMARY)),
+                                                        ),
+                                                ),
+                                        ),
+                                ),
+                        )
+                    })
+                    // Specific date presets
+                    .when(mode == DateAdjustMode::SetSpecific, |parent| {
+                        let cur_spec = self.batch_date.specific_date.clone();
+                        parent.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                    "Target Timestamp (YYYY:MM:DD HH:MM:SS):",
+                                ))
+                                .child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(rgb(0x1a_1a_20))
+                                        .border_1()
+                                        .border_color(rgb(BORDER_COLOR))
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .child(cur_spec.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .children(
+                                            [
+                                                "2026:01:01 12:00:00",
+                                                "2025:06:15 09:00:00",
+                                                "2024:12:25 18:00:00",
+                                            ]
+                                            .iter()
+                                            .map(|&preset| {
+                                                div()
+                                                    .px_2()
+                                                    .py(px(2.0))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .bg(rgb(0x2e_2e_38))
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.batch_date.specific_date =
+                                                                preset.to_string();
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(preset)
+                                            }),
+                                        ),
+                                ),
+                        )
+                    })
+                    // Status message
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if completed {
+                                rgb(0x22_c5_5e)
+                            } else {
+                                rgb(MUTED)
+                            })
+                            .child(self.batch_date.status_message.clone()),
+                    )
+                    // Footer
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x2e_2e_38))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.batch_date.is_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(if completed { "Done" } else { "Cancel" }),
+                            )
+                            .when(!completed, |parent| {
+                                parent.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_4()
+                                        .py(px(6.0))
+                                        .rounded_md()
+                                        .bg(if is_running {
+                                            rgb(0x4a_4a_56)
+                                        } else {
+                                            rgb(ACCENT)
+                                        })
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .cursor(if is_running {
+                                            CursorStyle::Arrow
+                                        } else {
+                                            CursorStyle::PointingHand
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.execute_batch_date(cx);
+                                            }),
+                                        )
+                                        .child(LucideIcon::Check.element(13.0, rgb(0xff_ff_ff)))
+                                        .child(if is_running {
+                                            "Updating…"
+                                        } else {
+                                            "Apply Changes"
+                                        }),
+                                )
+                            }),
+                    ),
+            )
+    }
+
+    fn render_duplicate_finder_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let match_mode = self.duplicate_finder.match_mode;
+        let is_scanning = self.duplicate_finder.is_scanning;
+        let groups = &self.duplicate_finder.groups;
+        let total_groups = groups.len();
+        let selected_count: usize = groups
+            .iter()
+            .flat_map(|g| &g.items)
+            .filter(|i| i.selected_for_removal)
+            .count();
+
+        div()
+            .absolute()
+            .size_full()
+            .bg(rgba(0x00_00_00_bb))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(640.0))
+                    .bg(rgb(0x22_22_28))
+                    .border_1()
+                    .border_color(rgb(BORDER_COLOR))
+                    .rounded_xl()
+                    .p_5()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(LucideIcon::Images.element(16.0, rgb(ACCENT)))
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_PRIMARY))
+                                            .child("Find Duplicate Images"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{total_groups} group(s) found")),
+                            ),
+                    )
+                    // Match mode & Scan trigger
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .children(
+                                        [DuplicateMatchMode::Visual, DuplicateMatchMode::Exact]
+                                            .into_iter()
+                                            .map(|m| {
+                                                let is_sel = m == match_mode;
+                                                div()
+                                                    .px_3()
+                                                    .py(px(4.0))
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .bg(if is_sel {
+                                                        rgb(ACCENT)
+                                                    } else {
+                                                        rgb(0x2e_2e_38)
+                                                    })
+                                                    .text_color(if is_sel {
+                                                        rgb(0xff_ff_ff)
+                                                    } else {
+                                                        rgb(TEXT_PRIMARY)
+                                                    })
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            this.duplicate_finder.match_mode = m;
+                                                            cx.notify();
+                                                        }),
+                                                    )
+                                                    .child(m.label())
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_3()
+                                    .py(px(4.0))
+                                    .rounded_md()
+                                    .bg(if is_scanning {
+                                        rgb(0x4a_4a_56)
+                                    } else {
+                                        rgb(ACCENT)
+                                    })
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xff_ff_ff))
+                                    .cursor(if is_scanning {
+                                        CursorStyle::Arrow
+                                    } else {
+                                        CursorStyle::PointingHand
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.execute_find_duplicates(cx);
+                                        }),
+                                    )
+                                    .child(LucideIcon::Zap.element(12.0, rgb(0xff_ff_ff)))
+                                    .child(if is_scanning {
+                                        "Scanning…"
+                                    } else {
+                                        "Scan Folder"
+                                    }),
+                            ),
+                    )
+                    // Progress / Status message
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if is_scanning { rgb(ACCENT) } else { rgb(MUTED) })
+                            .child(if is_scanning {
+                                self.duplicate_finder.progress_msg.clone()
+                            } else {
+                                self.duplicate_finder.status_message.clone()
+                            }),
+                    )
+                    // Groups list
+                    .child(
+                        div()
+                            .max_h(px(260.0))
+                            .overflow_hidden()
+                            .rounded_md()
+                            .bg(rgb(0x1a_1a_20))
+                            .border_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .when(groups.is_empty(), |parent| {
+                                parent.child(
+                                    div()
+                                        .py_8()
+                                        .text_center()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child(
+                                            "No duplicate groups yet. Click 'Scan Folder' above.",
+                                        ),
+                                )
+                            })
+                            .children(groups.iter().enumerate().map(|(g_idx, group)| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(rgb(0x22_22_2a))
+                                    .border_1()
+                                    .border_color(rgb(0x32_32_3e))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .pb_1()
+                                            .border_b_1()
+                                            .border_color(rgb(0x32_32_3e))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgb(ACCENT))
+                                                    .child(format!(
+                                                        "Duplicate Group #{}",
+                                                        group.group_id
+                                                    )),
+                                            )
+                                            .child(
+                                                div().text_xs().text_color(rgb(MUTED)).child(
+                                                    format!("{} matching files", group.items.len()),
+                                                ),
+                                            ),
+                                    )
+                                    .children(group.items.iter().enumerate().map(
+                                        |(i_idx, item)| {
+                                            let is_sel = item.selected_for_removal;
+                                            let size_str = format!(
+                                                "{:.1} MB",
+                                                item.size_bytes as f64 / 1_048_576.0
+                                            );
+                                            let dim_str = format!("{}×{}", item.width, item.height);
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .py(px(2.0))
+                                                .text_xs()
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .w(px(14.0))
+                                                                .h(px(14.0))
+                                                                .rounded_sm()
+                                                                .border_1()
+                                                                .border_color(if is_sel {
+                                                                    rgb(0xef_44_44)
+                                                                } else {
+                                                                    rgb(MUTED)
+                                                                })
+                                                                .bg(if is_sel {
+                                                                    rgb(0xef_44_44)
+                                                                } else {
+                                                                    rgb(0x1a_1a_22)
+                                                                })
+                                                                .cursor(CursorStyle::PointingHand)
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            if let Some(g) = this
+                                                                                .duplicate_finder
+                                                                                .groups
+                                                                                .get_mut(g_idx)
+                                                                            {
+                                                                                if let Some(it) = g
+                                                                                    .items
+                                                                                    .get_mut(i_idx)
+                                                                                {
+                                                                                    it.selected_for_removal = !it.selected_for_removal;
+                                                                                    cx.notify();
+                                                                                }
+                                                                            }
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .child(if is_sel {
+                                                                    LucideIcon::Check.element(
+                                                                        12.0,
+                                                                        rgb(0xff_ff_ff),
+                                                                    )
+                                                                } else {
+                                                                    LucideIcon::Check.element(
+                                                                        0.0,
+                                                                        rgb(0x00_00_00),
+                                                                    )
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_color(if is_sel {
+                                                                    rgb(0xef_44_44)
+                                                                } else {
+                                                                    rgb(TEXT_PRIMARY)
+                                                                })
+                                                                .child(item.filename.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .px_1()
+                                                                .py(px(1.0))
+                                                                .rounded_sm()
+                                                                .text_xs()
+                                                                .bg(if i_idx == 0 {
+                                                                    rgb(0x16_65_34)
+                                                                } else {
+                                                                    rgb(0x32_32_3c)
+                                                                })
+                                                                .text_color(if i_idx == 0 {
+                                                                    rgb(0x4a_de_80)
+                                                                } else {
+                                                                    rgb(MUTED)
+                                                                })
+                                                                .child(if i_idx == 0 {
+                                                                    "Keep Original"
+                                                                } else {
+                                                                    "Duplicate"
+                                                                }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_3()
+                                                        .text_color(rgb(MUTED))
+                                                        .child(dim_str)
+                                                        .child(size_str),
+                                                )
+                                        },
+                                    ))
+                            })),
+                    )
+                    // Footer actions
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(rgb(BORDER_COLOR))
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py(px(6.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x2e_2e_38))
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.duplicate_finder.is_open = false;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("Close"),
+                            )
+                            .when(selected_count > 0, |parent| {
+                                parent.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_4()
+                                        .py(px(6.0))
+                                        .rounded_md()
+                                        .bg(rgb(0xdc_26_26))
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgb(0xff_ff_ff))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.delete_selected_duplicates(cx);
+                                            }),
+                                        )
+                                        .child(LucideIcon::X.element(13.0, rgb(0xff_ff_ff)))
+                                        .child(format!("Delete Selected ({selected_count})")),
+                                )
+                            }),
+                    ),
+            )
+    }
+
     fn status_bar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let zoom_text = format!("{:.0}%", self.scale() * 100.0);
         let mode = if self.compare { "Original" } else { "Edited" };
@@ -5996,7 +7051,9 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_fullscreen))
             .on_action(cx.listener(Self::toggle_slideshow))
             .on_action(cx.listener(Self::toggle_batch_convert))
-            .on_action(cx.listener(Self::toggle_batch_rename));
+            .on_action(cx.listener(Self::toggle_batch_rename))
+            .on_action(cx.listener(Self::toggle_batch_date))
+            .on_action(cx.listener(Self::toggle_find_duplicates));
 
         // Fullscreen presentation view
         if self.presentation_mode {
@@ -6843,6 +7900,16 @@ impl Render for Editor {
         // Batch Rename Series Modal overlay if active
         if self.batch_rename.is_open {
             root = root.child(self.render_batch_rename_modal(cx));
+        }
+
+        // Batch Adjust Date Modal overlay if active
+        if self.batch_date.is_open {
+            root = root.child(self.render_batch_date_modal(cx));
+        }
+
+        // Duplicate Image Finder Modal overlay if active
+        if self.duplicate_finder.is_open {
+            root = root.child(self.render_duplicate_finder_modal(cx));
         }
 
         root

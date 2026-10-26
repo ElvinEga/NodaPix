@@ -38,5 +38,7 @@ actions!(
         ToggleSlideshow,
         ToggleBatchConvert,
         ToggleBatchRename,
+        ToggleBatchDate,
+        ToggleFindDuplicates,
     ]
 );

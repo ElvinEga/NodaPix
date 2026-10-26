@@ -18,9 +18,9 @@ use gpui::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
-    SaveAs, ToggleBatchConvert, ToggleBatchRename, ToggleCompare, ToggleCrop, ToggleFullscreen,
-    ToggleInfo, ToggleResize, ToggleSidebar, ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn,
-    ZoomOut,
+    SaveAs, ToggleBatchConvert, ToggleBatchDate, ToggleBatchRename, ToggleCompare, ToggleCrop,
+    ToggleFindDuplicates, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
+    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -62,6 +62,7 @@ fn main() {
             KeyBinding::new("space", ToggleSlideshow, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-c", ToggleBatchConvert, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-r", ToggleBatchRename, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-shift-d", ToggleFindDuplicates, Some(KEY_CONTEXT)),
             KeyBinding::new("left", PrevImage, Some(KEY_CONTEXT)),
             KeyBinding::new("right", NextImage, Some(KEY_CONTEXT)),
         ]);
@@ -119,6 +120,9 @@ fn main() {
             Menu::new("Tools").items(vec![
                 MenuItem::action("Batch Convert Format…", ToggleBatchConvert),
                 MenuItem::action("Batch Rename Series…", ToggleBatchRename),
+                MenuItem::action("Batch Adjust Date/Time…", ToggleBatchDate),
+                MenuItem::separator(),
+                MenuItem::action("Find Duplicate Images…", ToggleFindDuplicates),
             ]),
         ]);
 

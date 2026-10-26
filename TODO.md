@@ -102,15 +102,15 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
   - *Description*: Pattern-based batch file renamer with token replacement (e.g. `Trip_###`, `%04d`, `%F` original filename, `%Y%m%d` date, `%E` extension, start counter, case transform) with live preview table.
   - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleBatchRename` action, menu item, toolbar button, quick token presets, live preview table, and atomic rename.
 
-- [ ] **Batch EXIF Date/Time Adjuster**
+- [x] **Batch EXIF Date/Time Adjuster**
   - *Pix reference*: [`pix/extensions/change_date/`](file:///Users/solution/Development/rea/pix/pix/extensions/change_date/)
-  - *Description*: Batch adjust capture timestamps in EXIF blocks across multiple photos (e.g. offset by +N hours for timezone correction or synchronize camera clocks).
-  - *Target*: `crates/nodapix-imaging/src/metadata.rs` & `crates/nodapix-app/src/app.rs`
+  - *Description*: Batch adjust capture timestamps in EXIF blocks across multiple photos (e.g. offset by ±N hours/minutes for timezone correction or synchronize camera clocks, or set to a specific timestamp).
+  - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleBatchDate` action, zero-dependency Howard Hinnant civil date arithmetic, in-place EXIF string patching, and filesystem modification time sync.
 
-- [ ] **Duplicate Image Finder**
+- [x] **Duplicate Image Finder**
   - *Pix reference*: [`pix/extensions/find_duplicates/`](file:///Users/solution/Development/rea/pix/pix/extensions/find_duplicates/)
-  - *Description*: Fast folder scanner calculating 64-bit perceptual image hashes (dHash/pHash) and exact checksums to identify duplicate or near-duplicate photos.
-  - *Target*: `crates/nodapix-app/src/`
+  - *Description*: Fast folder scanner calculating 64-bit perceptual image difference hashes (dHash) and exact checksums to identify duplicate or near-duplicate photos.
+  - *Status*: Implemented in `nodapix-app/src/batch.rs` and `nodapix-app/src/app.rs` with `ToggleFindDuplicates` action, $9 \times 8$ perceptual luminance gradient hasher (hamming distance $\le 5$), grouped comparison table, keep-original vs duplicate badges, and 1-click duplicate removal.
 
 - [ ] **Contact Sheet Generator**
   - *Pix reference*: [`pix/extensions/contact_sheet/`](file:///Users/solution/Development/rea/pix/pix/extensions/contact_sheet/)
