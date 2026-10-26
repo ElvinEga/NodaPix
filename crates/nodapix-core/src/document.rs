@@ -20,7 +20,8 @@ pub fn render_proxy_preview(proxy: &PixelBuffer<f32>, state: &EditState) -> Pixe
 #[derive(Clone, Debug)]
 pub struct ImageDocument {
     /// Full-resolution original decoded image in linear f32 RGBA.
-    pub source: PixelBuffer<f32>,
+    /// Shared so a full-resolution export can be rendered on a worker thread.
+    pub source: Arc<PixelBuffer<f32>>,
     /// Display-resolution proxy image for 60fps slider updates.
     /// Shared so interactive renders can be dispatched off the main thread.
     pub proxy_source: Arc<PixelBuffer<f32>>,
@@ -38,7 +39,7 @@ impl ImageDocument {
     pub fn new(source: PixelBuffer<f32>, file_path: Option<PathBuf>) -> Self {
         let proxy_source = Arc::new(downsample_to_fit(&source, PROXY_MAX_DIMENSION));
         Self {
-            source,
+            source: Arc::new(source),
             proxy_source,
             state: EditState::default(),
             history: HistoryStack::default(),

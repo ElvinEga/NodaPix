@@ -7,6 +7,8 @@ actions!(
     [
         Quit,
         Open,
+        Save,
+        SaveAs,
         Export,
         Undo,
         Redo,

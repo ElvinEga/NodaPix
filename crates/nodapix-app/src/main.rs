@@ -9,14 +9,14 @@ mod render;
 use std::path::PathBuf;
 
 use gpui::{
-    App, AppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem, SystemMenuType, WindowBounds,
-    WindowOptions, px, size,
+    App, AppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem, SystemMenuType, TitlebarOptions,
+    WindowBounds, WindowOptions, px, size,
 };
 
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Quit, Redo,
-    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop,
-    ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs, ToggleCompare,
+    ToggleCrop, ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -30,6 +30,9 @@ fn main() {
 
         cx.bind_keys([
             KeyBinding::new("cmd-o", Open, None),
+            KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-alt-s", SaveAs, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-z", Undo, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-z", Redo, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-+", ZoomIn, Some(KEY_CONTEXT)),
@@ -41,7 +44,6 @@ fn main() {
             KeyBinding::new("shift-h", FlipH, Some(KEY_CONTEXT)),
             KeyBinding::new("shift-v", FlipV, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-e", ToggleSidebar, Some(KEY_CONTEXT)),
-            KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
             KeyBinding::new("c", ToggleCrop, Some(KEY_CONTEXT)),
             KeyBinding::new("enter", ApplyCrop, Some(KEY_CONTEXT)),
             KeyBinding::new("escape", CancelCrop, Some(KEY_CONTEXT)),
@@ -59,6 +61,9 @@ fn main() {
             ]),
             Menu::new("File").items(vec![
                 MenuItem::action("Open…", Open),
+                MenuItem::separator(),
+                MenuItem::action("Save", Save),
+                MenuItem::action("Save As…", SaveAs),
                 MenuItem::action("Export…", Export),
                 MenuItem::separator(),
                 MenuItem::action("File Info…", ToggleInfo),
@@ -96,6 +101,10 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("NodaPix".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             {

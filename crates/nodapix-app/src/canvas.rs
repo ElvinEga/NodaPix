@@ -97,6 +97,9 @@ pub fn fit_scale(image: Size<f32>, available: Size<f32>) -> f32 {
     if image.width <= 0.0 || image.height <= 0.0 {
         return 1.0;
     }
+    if available.width <= FIT_MARGIN || available.height <= FIT_MARGIN {
+        return 1.0;
+    }
     let by_width = (available.width - FIT_MARGIN) / image.width;
     let by_height = (available.height - FIT_MARGIN) / image.height;
     by_width.min(by_height).clamp(MIN_SCALE, MAX_SCALE)
@@ -194,8 +197,8 @@ impl Viewport {
                         }
 
                         let _ = window.paint_image(
-                            dest,
                             bounds,
+                            dest,
                             Corners::all(px(0.0)),
                             texture,
                             0,
@@ -383,7 +386,10 @@ impl Viewport {
                             }
                         }
                     },
-                ),
+                )
+                // A canvas lays out at its content size, which is zero: without this it
+                // would be handed a 0-height box and fit-to-window would collapse.
+                .size_full(),
             )
     }
 }

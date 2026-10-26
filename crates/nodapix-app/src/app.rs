@@ -1,18 +1,17 @@
 //! The editor view: owns the open document, the viewport interaction state, and the adjustment panel.
 
 use std::cell::Cell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
 use gpui::{
     div, point, px, size, App, Bounds, Context, CursorStyle, ExternalPaths, FocusHandle, Focusable,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent, SharedString, Size,
     Styled, Window, prelude::*, rgb, rgba,
 };
-use nodapix_core::{render_proxy_preview, EditState, ImageDocument};
+use nodapix_core::{execute_pipeline, render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
     calculate_auto_levels, compute_histogram, resize, CropRatioPreset, CropRect, ExportFormat,
     ExportOptions, FilterPreset, ImageBackend, ImageHistogram, ImageMetadata, NativeBackend,
@@ -20,8 +19,8 @@ use nodapix_imaging::{
 
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, Open, Redo,
-    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, ToggleCompare, ToggleCrop,
-    ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
+    ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs, ToggleCompare,
+    ToggleCrop, ToggleInfo, ToggleSidebar, Undo, ZoomIn, ZoomOut,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
@@ -39,6 +38,32 @@ const MUTED: u32 = 0x8a_8a_93;
 const ACCENT: u32 = 0x0a_84_ff;
 
 pub const KEY_CONTEXT: &str = "NodaPix";
+
+/// Keeps concurrent temp names unique within this process.
+static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Replace `path` with `bytes` through a sibling temp file, so a crashed or failed
+/// write can never leave the original half-written.
+fn write_atomically(bytes: &[u8], path: &Path) -> Result<(), String> {
+    let nonce = SAVE_NONCE.fetch_add(1, Ordering::SeqCst);
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.nodapix.tmp",
+        file_label(path),
+        std::process::id(),
+        nonce
+    ));
+    let result = std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| format!("{}: {}", path.display(), e))
+}
 
 struct CropDrag {
     handle: CropHandle,
@@ -97,6 +122,9 @@ pub struct Editor {
     // EXIF metadata inspector
     metadata: Option<ImageMetadata>,
     exif_open: bool,
+
+    /// Last title pushed to the window, so the render loop only re-sets it on change.
+    window_title: SharedString,
 }
 
 impl Editor {
@@ -126,6 +154,7 @@ impl Editor {
             export_settings: ExportSettings::default(),
             metadata: None,
             exif_open: false,
+            window_title: "NodaPix".into(),
         }
     }
 
@@ -154,6 +183,7 @@ impl Editor {
                 self.exif_open = false;
                 self.sync_geometry();
                 self.rebuild_original_texture();
+                self.edited = self.original.clone();
                 self.request_preview_render(cx);
                 let name = path
                     .file_name()
@@ -480,6 +510,141 @@ impl Editor {
                 }
             }
             cx.notify();
+        }
+    }
+
+    // ----------------------------------------------------------- save / save as
+
+    /// Replace `path` with `bytes` through a sibling temp file, so a crashed or
+    /// failed write can never leave the original half-written.
+    pub fn save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        let (dirty, path) = match &self.document {
+            Some(document) => (document.is_dirty, document.file_path.clone()),
+            None => return,
+        };
+        if !dirty {
+            self.status = "No changes to save".into();
+            cx.notify();
+            return;
+        }
+        let format = path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .and_then(ExportFormat::from_extension);
+        let (Some(path), Some(format)) = (path, format) else {
+            // Nothing to overwrite in place, or the original's format is one we
+            // cannot encode: let the user choose a writable destination.
+            self.save_as_dialog(cx);
+            return;
+        };
+
+        let name = file_label(&path);
+        let confirmed = rfd::MessageDialog::new()
+            .set_title("Replace Original?")
+            .set_description(format!(
+                "Saving overwrites {name} with the edited version, re-encoded as {format:?}. \
+                 Use Export to keep the original untouched. Replace it?"
+            ))
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show();
+        if confirmed != rfd::MessageDialogResult::Yes {
+            self.status = format!("Save cancelled — {name} left untouched").into();
+            cx.notify();
+            return;
+        }
+
+        self.begin_save(path, format, cx);
+    }
+
+    pub fn save_as(&mut self, _: &SaveAs, _: &mut Window, cx: &mut Context<Self>) {
+        self.save_as_dialog(cx);
+    }
+
+    fn save_as_dialog(&mut self, cx: &mut Context<Self>) {
+        let proposed = match &self.document {
+            Some(document) => document.file_name(),
+            None => "Untitled.jpg".to_string(),
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save As")
+            .set_file_name(&proposed)
+            .save_file()
+        else {
+            return;
+        };
+
+        let Some(format) = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(ExportFormat::from_extension)
+        else {
+            self.status = format!(
+                "Cannot save as {}: supported types are JPEG, PNG, WebP and TIFF",
+                file_label(&path)
+            )
+            .into();
+            cx.notify();
+            return;
+        };
+
+        self.begin_save(path, format, cx);
+    }
+
+    /// Render and encode on a worker thread: a full-resolution TIFF can take long
+    /// enough that doing it inline would freeze the sliders.
+    fn begin_save(&mut self, path: PathBuf, format: ExportFormat, cx: &mut Context<Self>) {
+        let Some(document) = &self.document else {
+            return;
+        };
+        let source = document.source.clone();
+        let state = document.state.clone();
+        let quality = self.export_settings.quality;
+        let label = file_label(&path);
+
+        self.status = format!("Saving {label}…").into();
+        cx.notify();
+
+        let executor = cx.background_executor().clone();
+        let destination = path.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = executor
+                .spawn(async move {
+                    let rendered = execute_pipeline(&source, &state);
+                    NativeBackend::new()
+                        .encode_to_bytes(&rendered, &ExportOptions { format, quality })
+                        .map_err(|e| e.to_string())
+                        .and_then(|bytes| write_atomically(&bytes, &destination))
+                        .map(|_| state)
+                })
+                .await;
+
+            let _ = this.update(cx, |editor, cx| {
+                editor.status = match outcome {
+                    Ok(saved_state) => {
+                        if let Some(document) = &mut editor.document {
+                            document.file_path = Some(path);
+                            // Edits made while the encoder ran are still unsaved.
+                            document.is_dirty = document.state != saved_state;
+                        }
+                        format!("Saved {label}").into()
+                    }
+                    Err(error) => format!("Save failed: {error}").into(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Filename plus the edited marker, mirrored into the titlebar.
+    fn title(&self) -> SharedString {
+        match &self.document {
+            Some(document) if document.is_dirty => {
+                format!("{} — Edited", document.file_name()).into()
+            }
+            Some(document) => document.file_name().into(),
+            None => "NodaPix".into(),
         }
     }
 
@@ -1663,11 +1828,19 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The dirty marker belongs in the titlebar, but re-setting it every frame
+        // would poke AppKit needlessly.
+        let title = self.title();
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
+
         let texture = if self.compare {
             self.original.clone().or_else(|| self.edited.clone())
         } else {
-            self.edited.clone()
+            self.edited.clone().or_else(|| self.original.clone())
         };
 
         let viewport = Viewport {
@@ -1693,6 +1866,8 @@ impl Render for Editor {
             .bg(rgb(BACKDROP))
             .text_color(rgb(TEXT))
             .on_action(cx.listener(Self::open))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::toggle_compare))
@@ -1892,5 +2067,36 @@ impl Render for Editor {
         }
 
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_atomically;
+
+    #[test]
+    fn atomic_replace_overwrites_without_leaving_temporaries() {
+        let dir = std::env::temp_dir().join(format!("nodapix-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.jpg");
+
+        write_atomically(b"original", &path).unwrap();
+        write_atomically(b"edited", &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"edited");
+
+        // A missing directory fails without touching the destination.
+        let missing = dir.join("sub/photo.jpg");
+        assert!(write_atomically(b"nope", &missing).is_err());
+        assert!(!missing.exists());
+
+        let debris: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(debris.is_empty(), "temporary files left behind: {debris:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
