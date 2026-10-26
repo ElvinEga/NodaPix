@@ -448,6 +448,69 @@ fn test_vignette_and_filter_presets() {
     let px = col_buf.get_pixel(0, 0);
     assert!((px[0] - px[1]).abs() < 1e-4);
     assert!((px[1] - px[2]).abs() < 1e-4);
+
+    // Negative / Invert test
+    let mut inv_buf = PixelBuffer::<f32>::new(2, 2);
+    inv_buf.set_pixel(0, 0, [0.8, 0.3, 0.1, 1.0]);
+    let mut inv_adj = ColorAdjustments::default();
+    inv_adj.invert = true;
+    apply_color_adjustments(&mut inv_buf, &inv_adj);
+    let ipx = inv_buf.get_pixel(0, 0);
+    assert!((ipx[0] - 0.2).abs() < 1e-4);
+    assert!((ipx[1] - 0.7).abs() < 1e-4);
+    assert!((ipx[2] - 0.9).abs() < 1e-4);
+
+    // Desaturate & Average B&W tests
+    let mut desat_buf = PixelBuffer::<f32>::new(2, 2);
+    desat_buf.set_pixel(0, 0, [0.9, 0.3, 0.1, 1.0]);
+    let mut desat_adj = ColorAdjustments::default();
+    desat_adj.filter_preset = FilterPreset::GrayscaleDesaturate;
+    apply_color_adjustments(&mut desat_buf, &desat_adj);
+    let dpx = desat_buf.get_pixel(0, 0);
+    // (0.9 + 0.1) / 2 = 0.5
+    assert!((dpx[0] - 0.5).abs() < 1e-4);
+    assert_eq!(dpx[0], dpx[1]);
+    assert_eq!(dpx[1], dpx[2]);
+
+    // Lomo, Vintage, and CrossProcess should produce valid clamped pixels
+    for preset in [FilterPreset::Lomo, FilterPreset::Vintage, FilterPreset::CrossProcess] {
+        let mut f_buf = PixelBuffer::<f32>::new(2, 2);
+        f_buf.set_pixel(0, 0, [0.6, 0.5, 0.4, 1.0]);
+        let mut f_adj = ColorAdjustments::default();
+        f_adj.filter_preset = preset;
+        apply_color_adjustments(&mut f_buf, &f_adj);
+        let fpx = f_buf.get_pixel(0, 0);
+        assert!(fpx[0] >= 0.0 && fpx[0] <= 1.0);
+        assert!(fpx[1] >= 0.0 && fpx[1] <= 1.0);
+        assert!(fpx[2] >= 0.0 && fpx[2] <= 1.0);
+    }
+}
+
+#[test]
+fn test_white_balance_from_sample() {
+    use nodapix_imaging::{
+        calculate_white_balance_from_sample, TEMPERATURE_MAX_KELVIN, TEMPERATURE_MIN_KELVIN,
+        TEMPERATURE_NEUTRAL_KELVIN,
+    };
+
+    // Neutral gray should return neutral temperature and tint
+    let (k_neutral, t_neutral) = calculate_white_balance_from_sample(0.5, 0.5, 0.5);
+    assert!((k_neutral - TEMPERATURE_NEUTRAL_KELVIN).abs() < 100.0);
+    assert!(t_neutral.abs() < 0.05);
+
+    // Warm tungsten cast (R=0.8, G=0.6, B=0.3): should decrease Kelvin to cool down
+    let (k_warm, _) = calculate_white_balance_from_sample(0.8, 0.6, 0.3);
+    assert!(k_warm < TEMPERATURE_NEUTRAL_KELVIN);
+    assert!(k_warm >= TEMPERATURE_MIN_KELVIN);
+
+    // Cool shadow/sky cast (R=0.3, G=0.5, B=0.8): should increase Kelvin to warm up
+    let (k_cool, _) = calculate_white_balance_from_sample(0.3, 0.5, 0.8);
+    assert!(k_cool > TEMPERATURE_NEUTRAL_KELVIN);
+    assert!(k_cool <= TEMPERATURE_MAX_KELVIN);
+
+    // Green cast (G=0.8, R=0.4, B=0.4): should produce positive tint (magenta correction)
+    let (_, t_green) = calculate_white_balance_from_sample(0.4, 0.8, 0.4);
+    assert!(t_green > 0.0);
 }
 
 #[test]

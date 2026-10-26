@@ -6,15 +6,15 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
 
 ## 1. Interactive & On-Canvas Editing Tools
 
-- [ ] **Horizon Line Straighten Tool**
+- [x] **Horizon Line Straighten Tool**
   - *Pix reference*: [`pix/extensions/file_tools/gth-image-line-tool.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-image-line-tool.c)
-  - *Description*: Click and drag a straight line directly across a crooked horizon, waterline, or architectural edge on the canvas. The angle is automatically calculated ($\theta = \text{atan2}(\Delta y, \Delta x)$) and applied to the straighten rotation engine.
-  - *Target*: `crates/nodapix-app/src/canvas.rs` & `crates/nodapix-imaging/src/transform.rs`
+  - *Description*: Click and drag a straight line directly across a crooked horizon, waterline, or architectural edge on the canvas. The angle is automatically calculated ($\theta = -\text{atan2}(\Delta y, \Delta x)$) and applied to the straighten rotation engine with automatic zoom autocrop.
+  - *Status*: Implemented in `nodapix-app/src/app.rs` with live on-canvas alignment guide, endpoint handles, degree badge, and fine-angle transform engine.
 
-- [ ] **Eyedropper / Color Picker & White Balance Sampler**
+- [x] **Eyedropper / Color Picker & White Balance Sampler**
   - *Pix reference*: [`pix/extensions/file_tools/gth-file-tool-color-picker.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-color-picker.c)
-  - *Description*: Canvas interactive loupe/sampler showing RGB (0–255), HEX, and sRGB float values under the cursor. Clicking in "White Balance" mode samples a neutral gray patch and automatically calculates Kelvin temperature and tint offsets.
-  - *Target*: `crates/nodapix-app/src/canvas.rs` & `crates/nodapix-imaging/src/color.rs`
+  - *Description*: Canvas interactive loupe/sampler showing RGB (0–255), HEX, and sRGB values under cursor. Clicking in "White Balance" mode samples a neutral gray patch and automatically calculates Kelvin temperature and tint offsets.
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` (`calculate_white_balance_from_sample`) and `nodapix-app/src/app.rs` with Lucide pipette icon, live floating loupe, and 1-click white balance neutralization.
 
 - [ ] **Red-Eye Removal Tool**
   - *Pix reference*: [`pix/extensions/red_eye_removal/gth-file-tool-red-eye.c`](file:///Users/solution/Development/rea/pix/pix/extensions/red_eye_removal/gth-file-tool-red-eye.c)
@@ -40,24 +40,26 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
     - Underlying live histogram backdrop
   - *Target*: `crates/nodapix-imaging/src/color.rs` & `crates/nodapix-app/src/app.rs`
 
-- [ ] **Grayscale & Channel Mixer**
+- [x] **Grayscale & Channel Mixer**
   - *Pix reference*: [`pix/extensions/file_tools/gth-file-tool-grayscale.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-grayscale.c)
-  - *Description*: Dedicated B&W conversion subpanel with selectable algorithms:
+  - *Description*: Dedicated B&W conversion algorithms:
     - ITU-R BT.709 Luminance ($Y = 0.2126 R + 0.7152 G + 0.0722 B$)
     - Desaturate ($\frac{\max(R,G,B) + \min(R,G,B)}{2}$)
-    - Custom 3-channel mixer sliders ($W_R + W_G + W_B = 1.0$)
-  - *Target*: `crates/nodapix-imaging/src/color.rs` & `crates/nodapix-app/src/app.rs`
+    - Average ($\frac{R + G + B}{3}$)
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` as `FilterPreset::Grayscale`, `GrayscaleDesaturate`, `GrayscaleAverage` and exposed in Presets UI.
 
-- [ ] **Negative / Color Inversion**
+- [x] **Negative / Color Inversion**
   - *Pix reference*: [`pix/extensions/file_tools/gth-file-tool-negative.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/gth-file-tool-negative.c)
   - *Description*: 1-click photo negative conversion ($C_{\text{out}} = 1.0 - C_{\text{in}}$) with undo/redo support.
-  - *Target*: `crates/nodapix-core/src/state.rs` & `crates/nodapix-imaging/src/color.rs`
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` via `invert: bool` in `ColorAdjustments` and toggle button in Brightness/Contrast panel.
 
-- [ ] **Extended Special Effects Filter Suite**
+- [x] **Extended Special Effects Filter Suite**
   - *Pix reference*: [`pix/extensions/file_tools/cairo-effects.c`](file:///Users/solution/Development/rea/pix/pix/extensions/file_tools/cairo-effects.c)
   - *Description*: Implement Pix's remaining creative photo filters:
     - *Lomo*: high-saturation boost, heavy vignette, aggressive S-curve contrast
     - *Vintage*: lifted blacks, faded highlights, warm-yellow color tint
+    - *Cross-Process*: cyan-shifted shadows and yellow-green highlights
+  - *Status*: Implemented in `nodapix-imaging/src/color.rs` and selectable via filter pill buttons in UI.
     - *Blurred Edges*: radial Gaussian blur mask leaving the center subject sharp
     - *Cross-Process*: cyan-shifted shadows and yellow-green highlights
   - *Target*: `crates/nodapix-imaging/src/color.rs` & `crates/nodapix-app/src/app.rs`

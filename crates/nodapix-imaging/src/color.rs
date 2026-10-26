@@ -34,6 +34,8 @@ pub struct ColorAdjustments {
     pub color_level: [f32; 3],
     /// Vignette falloff (-1.0 to 1.0, positive darkens corners, negative lightens)
     pub vignette: f32,
+    /// 1-click negative color inversion
+    pub invert: bool,
     /// Color filter preset
     pub filter_preset: FilterPreset,
 }
@@ -43,21 +45,31 @@ pub enum FilterPreset {
     #[default]
     None,
     BlackAndWhite,
+    GrayscaleDesaturate,
+    GrayscaleAverage,
     Sepia,
     WarmGold,
     CoolNordic,
     Vivid,
+    Lomo,
+    Vintage,
+    CrossProcess,
 }
 
 impl FilterPreset {
     pub fn label(&self) -> &'static str {
         match self {
             Self::None => "None",
-            Self::BlackAndWhite => "B&W",
+            Self::BlackAndWhite => "B&W (Luma)",
+            Self::GrayscaleDesaturate => "Desaturate",
+            Self::GrayscaleAverage => "Average B&W",
             Self::Sepia => "Sepia",
             Self::WarmGold => "Warm Gold",
             Self::CoolNordic => "Cool Nordic",
             Self::Vivid => "Vivid",
+            Self::Lomo => "Lomo",
+            Self::Vintage => "Vintage",
+            Self::CrossProcess => "Cross-Process",
         }
     }
 }
@@ -77,6 +89,7 @@ impl Default for ColorAdjustments {
             tint: 0.0,
             color_level: [0.0, 0.0, 0.0],
             vignette: 0.0,
+            invert: false,
             filter_preset: FilterPreset::None,
         }
     }
@@ -96,6 +109,7 @@ impl ColorAdjustments {
             && self.tint == 0.0
             && self.color_level == [0.0, 0.0, 0.0]
             && self.vignette == 0.0
+            && !self.invert
             && self.filter_preset == FilterPreset::None
     }
 }
@@ -356,13 +370,28 @@ pub fn apply_color_adjustments(buffer: &mut PixelBuffer<f32>, adj: &ColorAdjustm
             match adj.filter_preset {
                 FilterPreset::None => {}
                 FilterPreset::BlackAndWhite => {
-                    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    // Pix ITU-R BT.709 standard luminance weights
+                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
                     r = luma;
                     g = luma;
                     b = luma;
                 }
+                FilterPreset::GrayscaleDesaturate => {
+                    // Pix Desaturate algorithm: (max + min) / 2
+                    let l = (r.max(g).max(b) + r.min(g).min(b)) * 0.5;
+                    r = l;
+                    g = l;
+                    b = l;
+                }
+                FilterPreset::GrayscaleAverage => {
+                    // Pix Average algorithm: (r + g + b) / 3
+                    let avg = (r + g + b) / 3.0;
+                    r = avg;
+                    g = avg;
+                    b = avg;
+                }
                 FilterPreset::Sepia => {
-                    let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
                     r = (luma * 1.15).min(1.0);
                     g = luma * 0.95;
                     b = luma * 0.75;
@@ -382,6 +411,41 @@ pub fn apply_color_adjustments(buffer: &mut PixelBuffer<f32>, adj: &ColorAdjustm
                     g = lerp(g, 0.5, 0.12) * 1.04;
                     b = lerp(b, 0.5, 0.12) * 1.04;
                 }
+                FilterPreset::Lomo => {
+                    // Lomo: saturation boost + strong contrast S-curve
+                    let max = r.max(g).max(b);
+                    let min = r.min(g).min(b);
+                    let l = (max + min) * 0.5;
+                    r = lerp(r, l, 0.35);
+                    g = lerp(g, l, 0.35);
+                    b = lerp(b, l, 0.35);
+                    r = lerp(r, 0.5, 0.22);
+                    g = lerp(g, 0.5, 0.22);
+                    b = lerp(b, 0.5, 0.22);
+                }
+                FilterPreset::Vintage => {
+                    // Vintage: lifted black floor, faded highlights, warm golden wash
+                    r = (r * 0.88 + 0.09).min(1.0);
+                    g = (g * 0.85 + 0.06).min(1.0);
+                    b = (b * 0.74 + 0.04).min(1.0);
+                }
+                FilterPreset::CrossProcess => {
+                    // Cross-process: cyan shadows, yellow highlights
+                    let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    let shadow_mask = (1.0 - luma).powi(2);
+                    let highlight_mask = luma.powi(2);
+                    b = (b + shadow_mask * 0.12).min(1.0);
+                    g = (g + shadow_mask * 0.06).min(1.0);
+                    r = (r + highlight_mask * 0.10).min(1.0);
+                    g = (g + highlight_mask * 0.08).min(1.0);
+                }
+            }
+
+            // 11. Invert / Negative
+            if adj.invert {
+                r = 1.0 - r;
+                g = 1.0 - g;
+                b = 1.0 - b;
             }
 
             pixel[0] = r.clamp(0.0, 1.0);
@@ -539,4 +603,25 @@ pub fn calculate_auto_levels(buffer: &PixelBuffer<u8>) -> (f32, f32) {
     let exp_ev = ((128.0 - mid) / 128.0 * 0.7).clamp(-0.7, 0.7);
 
     (exp_ev, contrast_boost)
+}
+
+/// Neutralize color cast by sampling a known neutral white or gray pixel (r, g, b in 0.0..=1.0).
+/// Returns recommended `(temperature_kelvin, tint_offset)`.
+pub fn calculate_white_balance_from_sample(r: f32, g: f32, b: f32) -> (f32, f32) {
+    let y = (r + g + b) / 3.0;
+    if y < 0.02 {
+        return (TEMPERATURE_NEUTRAL_KELVIN, 0.0);
+    }
+
+    // Temperature ratio: if r > b, illuminant was warm, so lower Kelvin to cool image.
+    // If b > r, illuminant was cool, so increase Kelvin to warm image.
+    let temp_ratio = (b / r.max(0.01)).clamp(0.2, 5.0);
+    let kelvin = (TEMPERATURE_NEUTRAL_KELVIN * temp_ratio.powf(0.55))
+        .clamp(TEMPERATURE_MIN_KELVIN, TEMPERATURE_MAX_KELVIN);
+
+    // Tint: green deviation from red-blue midpoint
+    let expected_g = (r + b) * 0.5;
+    let tint = ((g - expected_g) / y * 2.5).clamp(-1.0, 1.0);
+
+    (kelvin, tint)
 }

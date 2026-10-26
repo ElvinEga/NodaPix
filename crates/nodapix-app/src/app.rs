@@ -8,16 +8,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, px, size, App, Bounds, Context, Corners, CursorStyle, ExternalPaths,
+    canvas, div, fill, point, px, size, App, Bounds, Context, Corners, CursorStyle, ExternalPaths,
     FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent,
     SharedString, Size, Styled, Window, prelude::*, rgb, rgba,
 };
 use nodapix_core::{execute_pipeline, render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
-    attach_exif, calculate_auto_levels, compute_histogram, resize, CropRatioPreset, CropRect,
-    ExportFormat, ExportOptions, FilterPreset, ImageBackend, ImageHistogram, ImageMetadata,
-    NativeBackend,
+    attach_exif, calculate_auto_levels, calculate_white_balance_from_sample, compute_histogram,
+    resize, CropRatioPreset, CropRect, ExportFormat, ExportOptions, FilterPreset, ImageBackend,
+    ImageHistogram, ImageMetadata, NativeBackend, PixelBuffer, TEMPERATURE_NEUTRAL_KELVIN,
 };
 
 use crate::actions::{
@@ -194,6 +194,18 @@ pub struct Editor {
     /// The source file's own EXIF block, re-embedded into every export.
     exif_block: Option<Vec<u8>>,
 
+    // Last rendered preview buffer for instant eyedropper pixel sampling
+    last_rendered_preview: Option<Arc<PixelBuffer<u8>>>,
+
+    // Horizon line straighten tool state
+    horizon_mode: bool,
+    horizon_start: Option<Point<Pixels>>,
+    horizon_current: Option<Point<Pixels>>,
+
+    // Eyedropper / White balance sampler state
+    eyedropper_active: bool,
+    eyedropper_sample: Option<([u8; 4], String, Point<Pixels>)>,
+
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
 }
@@ -230,10 +242,16 @@ impl Editor {
             thumbnail_cache: HashMap::new(),
             thumbnail_pane_open: true,
             file_size_bytes: 0,
-            active_tool_group: Some(ToolGroup::BrightnessContrast),
+            active_tool_group: None,
             metadata: None,
             exif_open: false,
             exif_block: None,
+            last_rendered_preview: None,
+            horizon_mode: false,
+            horizon_start: None,
+            horizon_current: None,
+            eyedropper_active: false,
+            eyedropper_sample: None,
             window_title: "NodaPix".into(),
         }
     }
@@ -505,6 +523,7 @@ impl Editor {
                 }
                 editor.histogram = Some(hist);
                 editor.edited = Some(texture_from_rgba8(&rendered));
+                editor.last_rendered_preview = Some(Arc::new(rendered));
                 cx.notify();
             });
         })
@@ -561,6 +580,11 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.edit(cx, |state| state.reset_adjustments());
+        self.horizon_mode = false;
+        self.horizon_start = None;
+        self.horizon_current = None;
+        self.eyedropper_active = false;
+        self.eyedropper_sample = None;
         cx.notify();
     }
 
@@ -1046,6 +1070,45 @@ impl Editor {
     }
 
     fn begin_pan(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.eyedropper_active {
+            if let (Some(dest), Some(rendered)) = (self.image_dest.get(), &self.last_rendered_preview) {
+                let bx = f32::from(dest.origin.x);
+                let by = f32::from(dest.origin.y);
+                let bw = f32::from(dest.size.width);
+                let bh = f32::from(dest.size.height);
+                let mx = f32::from(event.position.x);
+                let my = f32::from(event.position.y);
+                if mx >= bx && mx < bx + bw && my >= by && my < by + bh && bw > 0.0 && bh > 0.0 {
+                    let nx = (mx - bx) / bw;
+                    let ny = (my - by) / bh;
+                    let px_coord = ((nx * rendered.width as f32) as u32).min(rendered.width.saturating_sub(1));
+                    let py_coord = ((ny * rendered.height as f32) as u32).min(rendered.height.saturating_sub(1));
+                    let idx = (py_coord as usize * rendered.width as usize + px_coord as usize) * 4;
+                    let r = rendered.data[idx] as f32 / 255.0;
+                    let g = rendered.data[idx + 1] as f32 / 255.0;
+                    let b = rendered.data[idx + 2] as f32 / 255.0;
+
+                    let (kelvin, tint) = calculate_white_balance_from_sample(r, g, b);
+                    self.edit(cx, |state| {
+                        state.color.temperature = kelvin;
+                        state.color.tint = tint;
+                    });
+                    self.status = format!("White balance adjusted: {:.0}K, tint {:+.2}", kelvin, tint).into();
+                    self.eyedropper_active = false;
+                    self.eyedropper_sample = None;
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        if self.horizon_mode {
+            self.horizon_start = Some(event.position);
+            self.horizon_current = Some(event.position);
+            cx.notify();
+            return;
+        }
+
         if self.crop_mode {
             if let (Some(dest), Some(crop)) = (self.image_dest.get(), self.draft_crop) {
                 if let Some(handle) = hit_test_crop(event.position, dest, crop) {
@@ -1064,6 +1127,43 @@ impl Editor {
     }
 
     fn drag_pan(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.eyedropper_active {
+            if let (Some(dest), Some(rendered)) = (self.image_dest.get(), &self.last_rendered_preview) {
+                let bx = f32::from(dest.origin.x);
+                let by = f32::from(dest.origin.y);
+                let bw = f32::from(dest.size.width);
+                let bh = f32::from(dest.size.height);
+                let mx = f32::from(event.position.x);
+                let my = f32::from(event.position.y);
+                if mx >= bx && mx < bx + bw && my >= by && my < by + bh && bw > 0.0 && bh > 0.0 {
+                    let nx = (mx - bx) / bw;
+                    let ny = (my - by) / bh;
+                    let px_coord = ((nx * rendered.width as f32) as u32).min(rendered.width.saturating_sub(1));
+                    let py_coord = ((ny * rendered.height as f32) as u32).min(rendered.height.saturating_sub(1));
+                    let idx = (py_coord as usize * rendered.width as usize + px_coord as usize) * 4;
+                    let r = rendered.data[idx];
+                    let g = rendered.data[idx + 1];
+                    let b = rendered.data[idx + 2];
+                    let a = rendered.data[idx + 3];
+                    let hex = format!("#{:02X}{:02X}{:02X}", r, g, b);
+                    self.eyedropper_sample = Some(([r, g, b, a], hex, event.position));
+                    cx.notify();
+                    return;
+                } else {
+                    self.eyedropper_sample = None;
+                    cx.notify();
+                }
+            }
+        }
+
+        if self.horizon_mode {
+            if self.horizon_start.is_some() {
+                self.horizon_current = Some(event.position);
+                cx.notify();
+                return;
+            }
+        }
+
         if let Some(drag) = &self.crop_drag {
             let Some(dest) = self.image_dest.get() else {
                 return;
@@ -1232,6 +1332,37 @@ impl Editor {
     }
 
     fn end_pan(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.horizon_mode {
+            if let (Some(p1), Some(p2)) = (self.horizon_start, self.horizon_current) {
+                let dx = f32::from(p2.x) - f32::from(p1.x);
+                let dy = f32::from(p2.y) - f32::from(p1.y);
+                if dx.hypot(dy) > 10.0 {
+                    let angle_rad = if dx.abs() >= dy.abs() {
+                        -dy.atan2(dx)
+                    } else if dy > 0.0 {
+                        dx.atan2(dy)
+                    } else {
+                        (-dx).atan2(-dy)
+                    };
+                    let mut angle_deg = angle_rad * 180.0 / std::f32::consts::PI;
+                    while angle_deg > 45.0 {
+                        angle_deg -= 90.0;
+                    }
+                    while angle_deg < -45.0 {
+                        angle_deg += 90.0;
+                    }
+                    let angle_deg = angle_deg.clamp(-45.0, 45.0);
+                    self.edit(cx, |state| state.angle_fine_degrees = angle_deg);
+                    self.status = format!("Aligned to horizon line: {:+.2}°", angle_deg).into();
+                }
+            }
+            self.horizon_start = None;
+            self.horizon_current = None;
+            self.horizon_mode = false;
+            cx.notify();
+            return;
+        }
+
         self.crop_drag = None;
         self.drag_origin = None;
         cx.notify();
@@ -2293,10 +2424,15 @@ impl Editor {
         let filter_presets = [
             FilterPreset::None,
             FilterPreset::BlackAndWhite,
+            FilterPreset::GrayscaleDesaturate,
+            FilterPreset::GrayscaleAverage,
             FilterPreset::Sepia,
             FilterPreset::WarmGold,
             FilterPreset::CoolNordic,
             FilterPreset::Vivid,
+            FilterPreset::Lomo,
+            FilterPreset::Vintage,
+            FilterPreset::CrossProcess,
         ];
 
         let (title, icon, has_histogram) = match group {
@@ -2372,11 +2508,16 @@ impl Editor {
                                     ToolGroup::BrightnessContrast => this.edit(cx, |state| {
                                         state.color.brightness = 0.0;
                                         state.color.contrast = 0.0;
+                                        state.color.invert = false;
                                     }),
-                                    ToolGroup::ColorBalance => this.edit(cx, |state| {
-                                        state.color.temperature = 0.0;
-                                        state.color.tint = 0.0;
-                                    }),
+                                    ToolGroup::ColorBalance => {
+                                        this.edit(cx, |state| {
+                                            state.color.temperature = TEMPERATURE_NEUTRAL_KELVIN;
+                                            state.color.tint = 0.0;
+                                        });
+                                        this.eyedropper_active = false;
+                                        this.eyedropper_sample = None;
+                                    }
                                     ToolGroup::Levels => this.edit(cx, |state| {
                                         state.color.exposure = 0.0;
                                         state.color.highlights = 0.0;
@@ -2393,9 +2534,14 @@ impl Editor {
                                         state.color.vignette = 0.0;
                                         state.color.filter_preset = FilterPreset::None;
                                     }),
-                                    ToolGroup::Straighten => this.edit(cx, |state| {
-                                        state.angle_fine_degrees = 0.0;
-                                    }),
+                                    ToolGroup::Straighten => {
+                                        this.edit(cx, |state| {
+                                            state.angle_fine_degrees = 0.0;
+                                        });
+                                        this.horizon_mode = false;
+                                        this.horizon_start = None;
+                                        this.horizon_current = None;
+                                    }
                                 }
                             }))
                             .child("Reset"),
@@ -2435,6 +2581,35 @@ impl Editor {
                                     SliderSpec::CONTRAST.get_value(state),
                                     bounds.clone(),
                                 ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .pt_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(TEXT_PRIMARY))
+                                                .child("Invert (Negative)"),
+                                        )
+                                        .child(
+                                            div()
+                                                .px_2()
+                                                .py(px(3.0))
+                                                .text_xs()
+                                                .rounded_sm()
+                                                .bg(if state.color.invert { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                                .text_color(if state.color.invert { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                                .border_1()
+                                                .border_color(if state.color.invert { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
+                                                .cursor(CursorStyle::PointingHand)
+                                                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                    this.edit(cx, |state| state.color.invert = !state.color.invert);
+                                                }))
+                                                .child(if state.color.invert { "Inverted" } else { "Normal" }),
+                                        ),
+                                )
                             })
                             .when(group == ToolGroup::ColorBalance, |el| {
                                 el.child(render_slider_row(
@@ -2447,6 +2622,33 @@ impl Editor {
                                     SliderSpec::TINT.get_value(state),
                                     bounds.clone(),
                                 ))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .py(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_1()
+                                        .rounded_sm()
+                                        .bg(if self.eyedropper_active { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                        .text_color(if self.eyedropper_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                        .border_1()
+                                        .border_color(if self.eyedropper_active { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                            this.eyedropper_active = !this.eyedropper_active;
+                                            this.eyedropper_sample = None;
+                                            cx.notify();
+                                        }))
+                                        .child(LucideIcon::Pipette.element(14.0, if self.eyedropper_active { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .child(if self.eyedropper_active { "Click Neutral Gray to Balance…" } else { "Sample White Balance" }),
+                                        ),
+                                )
                             })
                             .when(group == ToolGroup::Levels, |el| {
                                 el.child(render_slider_row(
@@ -2556,6 +2758,34 @@ impl Editor {
                                                     this.edit(cx, |state| state.angle_fine_degrees = 0.0);
                                                 }))
                                                 .child("Reset Angle (0°)"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .py(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_1()
+                                        .rounded_sm()
+                                        .bg(if self.horizon_mode { rgb(ACCENT) } else { rgb(0x2a_2a_33) })
+                                        .text_color(if self.horizon_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                        .border_1()
+                                        .border_color(if self.horizon_mode { rgb(ACCENT) } else { rgb(BORDER_COLOR) })
+                                        .cursor(CursorStyle::PointingHand)
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                            this.horizon_mode = !this.horizon_mode;
+                                            this.horizon_start = None;
+                                            this.horizon_current = None;
+                                            cx.notify();
+                                        }))
+                                        .child(LucideIcon::Activity.element(14.0, if self.horizon_mode { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) }))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .child(if self.horizon_mode { "Drag Horizon Line on Image…" } else { "Draw Alignment Line…" }),
                                         ),
                                 )
                                 .child(
@@ -4088,7 +4318,7 @@ impl Render for Editor {
                         .flex_1()
                         .relative()
                         .overflow_hidden()
-                        .cursor(if self.crop_mode { CursorStyle::Crosshair } else { CursorStyle::OpenHand })
+                        .cursor(if self.crop_mode || self.horizon_mode || self.eyedropper_active { CursorStyle::Crosshair } else { CursorStyle::OpenHand })
                         .on_scroll(cx.listener(Self::on_scroll))
                         .on_pinch(cx.listener(Self::on_pinch))
                         .on_drop(cx.listener(Self::on_drop))
@@ -4155,6 +4385,154 @@ impl Render for Editor {
                                     ),
                             );
                     }
+
+                    // Alignment guide line overlay on canvas when dragging in Horizon mode
+                    if let (Some(p1), Some(p2)) = (self.horizon_start, self.horizon_current) {
+                        let p1_x = f32::from(p1.x);
+                        let p1_y = f32::from(p1.y);
+                        let p2_x = f32::from(p2.x);
+                        let p2_y = f32::from(p2.y);
+                        let dx = p2_x - p1_x;
+                        let dy = p2_y - p1_y;
+                        let angle_rad = if dx.abs() >= dy.abs() {
+                            -dy.atan2(dx)
+                        } else if dy > 0.0 {
+                            dx.atan2(dy)
+                        } else {
+                            (-dx).atan2(-dy)
+                        };
+                        let mut angle_deg = angle_rad * 180.0 / std::f32::consts::PI;
+                        while angle_deg > 45.0 {
+                            angle_deg -= 90.0;
+                        }
+                        while angle_deg < -45.0 {
+                            angle_deg += 90.0;
+                        }
+                        let angle_deg = angle_deg.clamp(-45.0, 45.0);
+
+                        canvas_container = canvas_container.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .child(canvas(
+                                    move |_, _, _| {},
+                                    move |_, _, window, _| {
+                                        let dist = dx.hypot(dy);
+                                        let steps = (dist / 2.0).max(1.0) as usize;
+                                        for i in 0..=steps {
+                                            let t = i as f32 / steps as f32;
+                                            let x = p1_x + dx * t;
+                                            let y = p1_y + dy * t;
+                                            window.paint_quad(fill(
+                                                Bounds {
+                                                    origin: point(px(x - 1.0), px(y - 1.0)),
+                                                    size: size(px(2.0), px(2.0)),
+                                                },
+                                                rgb(0x38_bd_f8),
+                                            ));
+                                        }
+                                        // Endpoints
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(p1_x - 5.0), px(p1_y - 5.0)),
+                                                size: size(px(10.0), px(10.0)),
+                                            },
+                                            rgb(0x38_bd_f8),
+                                        ));
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(p1_x - 2.0), px(p1_y - 2.0)),
+                                                size: size(px(4.0), px(4.0)),
+                                            },
+                                            rgb(0xff_ff_ff),
+                                        ));
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(p2_x - 5.0), px(p2_y - 5.0)),
+                                                size: size(px(10.0), px(10.0)),
+                                            },
+                                            rgb(0x38_bd_f8),
+                                        ));
+                                        window.paint_quad(fill(
+                                            Bounds {
+                                                origin: point(px(p2_x - 2.0), px(p2_y - 2.0)),
+                                                size: size(px(4.0), px(4.0)),
+                                            },
+                                            rgb(0xff_ff_ff),
+                                        ));
+                                    },
+                                ))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(p2_x + 12.0))
+                                        .top(px(p2_y - 12.0))
+                                        .px_2()
+                                        .py(px(2.0))
+                                        .rounded_sm()
+                                        .bg(rgb(0x18_18_20))
+                                        .border_1()
+                                        .border_color(rgb(0x38_bd_f8))
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(rgb(0x38_bd_f8))
+                                        .child(format!("{:+.2}°", angle_deg)),
+                                ),
+                        );
+                    }
+
+                    // Floating pixel color loupe when Eyedropper mode is active
+                    if self.eyedropper_active {
+                        if let Some(([r, g, b, _], hex, pos)) = &self.eyedropper_sample {
+                            let lx = (f32::from(pos.x) + 16.0).max(10.0);
+                            let ly = (f32::from(pos.y) - 50.0).max(10.0);
+                            let hex_str = hex.clone();
+                            let color_rgb = ((*r as u32) << 16) | ((*g as u32) << 8) | (*b as u32);
+                            canvas_container = canvas_container.child(
+                                div()
+                                    .absolute()
+                                    .left(px(lx))
+                                    .top(px(ly))
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_2()
+                                    .py(px(4.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x18_18_22))
+                                    .border_1()
+                                    .border_color(rgb(BORDER_COLOR))
+                                    .child(
+                                        div()
+                                            .w(px(20.0))
+                                            .h(px(20.0))
+                                            .rounded_sm()
+                                            .border_1()
+                                            .border_color(rgb(0xff_ff_ff))
+                                            .bg(rgb(color_rgb)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(rgb(TEXT_PRIMARY))
+                                                    .child(hex_str),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MUTED))
+                                                    .child(format!("RGB: {}, {}, {}", r, g, b)),
+                                            ),
+                                    ),
+                            );
+                        }
+                    }
+
                     canvas_container
                 })
                 .when(self.thumbnail_pane_open && !self.folder_images.is_empty(), |this| {
