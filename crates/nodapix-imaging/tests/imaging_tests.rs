@@ -737,3 +737,14 @@ fn test_red_eye_removal_neutralization() {
     assert_eq!(fixed_px[1], 0.1);
     assert_eq!(fixed_px[2], 0.1);
 }
+
+#[test]
+fn test_metadata_color_space() {
+    let mut meta = ImageMetadata::default();
+    assert!(meta.is_empty());
+    assert_eq!(meta.color_space, None);
+
+    meta.color_space = Some("sRGB".to_string());
+    assert!(!meta.is_empty());
+    assert_eq!(meta.color_space.as_deref(), Some("sRGB"));
+}

@@ -34,5 +34,7 @@ actions!(
         NextImage,
         ToggleThumbnailPane,
         ToggleResize,
+        ToggleFullscreen,
+        ToggleSlideshow,
     ]
 );

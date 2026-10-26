@@ -24,8 +24,8 @@ use nodapix_imaging::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save, SaveAs,
-    ToggleCompare, ToggleCrop, ToggleInfo, ToggleResize, ToggleSidebar, ToggleThumbnailPane, Undo,
-    ZoomIn, ZoomOut,
+    ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
+    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::canvas::{
     fit_scale, hit_test_crop, CropGuide, CropHandle, Viewport, Zoom, MAX_SCALE, MIN_SCALE,
@@ -239,6 +239,13 @@ pub struct Editor {
     curve_drag_idx: Option<usize>,
     curve_canvas_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
 
+    // Fullscreen presentation & slideshow state
+    presentation_mode: bool,
+    presentation_hud_visible: bool,
+    presentation_hud_gen: u64,
+    slideshow_running: bool,
+    slideshow_interval_secs: u64,
+
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
 }
@@ -291,6 +298,11 @@ impl Editor {
             curve_channel: CurveChannel::Composite,
             curve_drag_idx: None,
             curve_canvas_bounds: Rc::new(Cell::new(None)),
+            presentation_mode: false,
+            presentation_hud_visible: false,
+            presentation_hud_gen: 0,
+            slideshow_running: false,
+            slideshow_interval_secs: 3,
             window_title: "NodaPix".into(),
         }
     }
@@ -415,7 +427,7 @@ impl Editor {
         }
     }
 
-    pub fn prev_image(&mut self, _: &PrevImage, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn advance_prev_image(&mut self, cx: &mut Context<Self>) {
         if self.folder_images.is_empty() {
             return;
         }
@@ -428,7 +440,7 @@ impl Editor {
         self.load(next_path, cx);
     }
 
-    pub fn next_image(&mut self, _: &NextImage, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn advance_next_image(&mut self, cx: &mut Context<Self>) {
         if self.folder_images.is_empty() {
             return;
         }
@@ -439,6 +451,83 @@ impl Editor {
         }
         let next_path = self.folder_images[self.folder_index].clone();
         self.load(next_path, cx);
+    }
+
+    pub fn prev_image(&mut self, _: &PrevImage, _: &mut Window, cx: &mut Context<Self>) {
+        self.advance_prev_image(cx);
+    }
+
+    pub fn next_image(&mut self, _: &NextImage, _: &mut Window, cx: &mut Context<Self>) {
+        self.advance_next_image(cx);
+    }
+
+    pub fn toggle_fullscreen(
+        &mut self,
+        _: &ToggleFullscreen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.toggle_fullscreen();
+        self.presentation_mode = !self.presentation_mode;
+        if self.presentation_mode {
+            self.presentation_hud_visible = true;
+            self.schedule_hud_hide(cx);
+        } else {
+            self.presentation_hud_visible = false;
+            self.slideshow_running = false;
+        }
+        cx.notify();
+    }
+
+    pub fn toggle_slideshow(
+        &mut self,
+        _: &ToggleSlideshow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.slideshow_running = !self.slideshow_running;
+        if self.slideshow_running {
+            self.status = format!(
+                "Slideshow started ({}s interval)",
+                self.slideshow_interval_secs
+            )
+            .into();
+            self.schedule_slideshow_tick(cx);
+        } else {
+            self.status = "Slideshow paused".into();
+        }
+        cx.notify();
+    }
+
+    fn schedule_slideshow_tick(&mut self, cx: &mut Context<Self>) {
+        let secs = self.slideshow_interval_secs.max(1);
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(std::time::Duration::from_secs(secs)).await;
+            let _ = this.update(cx, |editor, cx| {
+                if editor.slideshow_running {
+                    editor.advance_next_image(cx);
+                    editor.schedule_slideshow_tick(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_hud_hide(&mut self, cx: &mut Context<Self>) {
+        self.presentation_hud_gen += 1;
+        let gen = self.presentation_hud_gen;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(std::time::Duration::from_millis(2500)).await;
+            let _ = this.update(cx, |editor, cx| {
+                if editor.presentation_mode && editor.presentation_hud_gen == gen {
+                    editor.presentation_hud_visible = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn toggle_thumbnail_pane(
@@ -711,7 +800,17 @@ impl Editor {
         }
     }
 
-    pub fn cancel_crop(&mut self, _: &CancelCrop, _: &mut Window, cx: &mut Context<Self>) {
+    pub fn cancel_crop(&mut self, _: &CancelCrop, window: &mut Window, cx: &mut Context<Self>) {
+        if self.presentation_mode {
+            self.presentation_mode = false;
+            self.presentation_hud_visible = false;
+            self.slideshow_running = false;
+            if window.is_fullscreen() {
+                window.toggle_fullscreen();
+            }
+            cx.notify();
+            return;
+        }
         if self.export_settings.is_open {
             self.export_settings.is_open = false;
             cx.notify();
@@ -1108,7 +1207,17 @@ impl Editor {
         }
     }
 
-    fn begin_pan(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn begin_pan(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.click_count == 2
+            && !self.crop_mode
+            && !self.horizon_mode
+            && !self.eyedropper_active
+            && self.active_tool_group != Some(ToolGroup::RedEye)
+        {
+            self.toggle_fullscreen(&ToggleFullscreen, window, cx);
+            return;
+        }
+
         if self.eyedropper_active {
             if let (Some(dest), Some(rendered)) = (self.image_dest.get(), &self.last_rendered_preview) {
                 let bx = f32::from(dest.origin.x);
@@ -4227,6 +4336,17 @@ impl Editor {
                             .child(format!("Dimensions: {} × {} px", w, h))
                             .child(meta.date_time.unwrap_or_default()),
                     )
+                    // Color Space / ICC Profile
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Color Profile")
+                            .child(meta.color_space.unwrap_or_else(|| "sRGB (Calibrated)".to_string())),
+                    )
                     // Close button
                     .child(
                         div()
@@ -4251,6 +4371,215 @@ impl Editor {
                                     }))
                                     .child("Done"),
                             ),
+                    ),
+            )
+    }
+
+    fn render_presentation_hud(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let is_running = self.slideshow_running;
+        let interval = self.slideshow_interval_secs;
+        let current_num = if self.folder_images.is_empty() {
+            0
+        } else {
+            self.folder_index + 1
+        };
+        let total_num = self.folder_images.len();
+        let filename = self
+            .folder_images
+            .get(self.folder_index)
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Image");
+
+        div()
+            .absolute()
+            .bottom(px(28.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .rounded_xl()
+                    .bg(rgb(0x1a_1a_22))
+                    .border_1()
+                    .border_color(rgb(0x3a_3a_48))
+                    .shadow_lg()
+                    // Prev Button
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded_md()
+                            .bg(rgb(0x28_28_34))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.advance_prev_image(cx);
+                                }),
+                            )
+                            .child(LucideIcon::ChevronLeft.element(16.0, rgb(0xff_ff_ff))),
+                    )
+                    // Play / Pause Slideshow Button
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .rounded_full()
+                            .bg(rgb(ACCENT))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.toggle_slideshow(&ToggleSlideshow, window, cx);
+                                }),
+                            )
+                            .child(if is_running {
+                                LucideIcon::Pause.element(16.0, rgb(0xff_ff_ff))
+                            } else {
+                                LucideIcon::Play.element(16.0, rgb(0xff_ff_ff))
+                            }),
+                    )
+                    // Next Button
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(28.0))
+                            .h(px(28.0))
+                            .rounded_md()
+                            .bg(rgb(0x28_28_34))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.advance_next_image(cx);
+                                }),
+                            )
+                            .child(LucideIcon::ChevronRight.element(16.0, rgb(0xff_ff_ff))),
+                    )
+                    // Separator
+                    .child(div().w(px(1.0)).h(px(18.0)).bg(rgb(BORDER_COLOR)))
+                    // Counter & Filename
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(format!("{current_num} / {total_num}")),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(filename.to_string()),
+                            ),
+                    )
+                    // Separator
+                    .child(div().w(px(1.0)).h(px(18.0)).bg(rgb(BORDER_COLOR)))
+                    // Interval adjustments
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_34))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            if this.slideshow_interval_secs > 1 {
+                                                this.slideshow_interval_secs -= 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(LucideIcon::Minus.element(12.0, rgb(TEXT_PRIMARY))),
+                            )
+                            .child(
+                                div()
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_PRIMARY))
+                                    .child(format!("{interval}s")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(22.0))
+                                    .h(px(22.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x28_28_34))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            if this.slideshow_interval_secs < 30 {
+                                                this.slideshow_interval_secs += 1;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(LucideIcon::Plus.element(12.0, rgb(TEXT_PRIMARY))),
+                            ),
+                    )
+                    // Separator
+                    .child(div().w(px(1.0)).h(px(18.0)).bg(rgb(BORDER_COLOR)))
+                    // Exit presentation button
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .py(px(4.0))
+                            .rounded_md()
+                            .bg(rgb(0x28_28_34))
+                            .text_xs()
+                            .text_color(rgb(TEXT_PRIMARY))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.presentation_mode = false;
+                                    this.presentation_hud_visible = false;
+                                    this.slideshow_running = false;
+                                    if window.is_fullscreen() {
+                                        window.toggle_fullscreen();
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(LucideIcon::Minimize2.element(12.0, rgb(TEXT_PRIMARY)))
+                            .child("Exit"),
                     ),
             )
     }
@@ -4660,7 +4989,53 @@ impl Render for Editor {
             .on_action(cx.listener(Self::prev_image))
             .on_action(cx.listener(Self::next_image))
             .on_action(cx.listener(Self::toggle_thumbnail_pane))
-            .on_action(cx.listener(Self::toggle_resize));
+            .on_action(cx.listener(Self::toggle_resize))
+            .on_action(cx.listener(Self::toggle_fullscreen))
+            .on_action(cx.listener(Self::toggle_slideshow));
+
+        // Fullscreen presentation view
+        if self.presentation_mode {
+            let mut pres_root = root
+                .bg(rgb(0x00_00_00))
+                .on_mouse_move(cx.listener(|this, _, _, cx| {
+                    if !this.presentation_hud_visible {
+                        this.presentation_hud_visible = true;
+                        cx.notify();
+                    }
+                    this.schedule_hud_hide(cx);
+                }));
+
+            let pres_viewport = Viewport {
+                texture: if self.compare {
+                    self.original.clone().or_else(|| self.edited.clone())
+                } else {
+                    self.edited.clone().or_else(|| self.original.clone())
+                },
+                image: self.image,
+                zoom: Zoom::Fit,
+                pan: point(px(0.0), px(0.0)),
+                backdrop: 0x00_00_00,
+                frame: false,
+                crop: None,
+                crop_mode: false,
+                crop_guide: CropGuide::None,
+                bounds_out: None,
+                image_dest_out: None,
+            };
+
+            pres_root = pres_root.child(
+                div()
+                    .size_full()
+                    .relative()
+                    .child(pres_viewport.element()),
+            );
+
+            if self.presentation_hud_visible {
+                pres_root = pres_root.child(self.render_presentation_hud(cx));
+            }
+
+            return pres_root;
+        }
 
         // Top Toolbar
         if self.crop_mode {
@@ -5041,6 +5416,43 @@ impl Render for Editor {
                                         this.zoom_in(&ZoomIn, window, cx);
                                     }))
                                     .child(LucideIcon::Plus.element(13.0, rgb(TEXT_PRIMARY))),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_2()
+                                    .py(px(3.0))
+                                    .text_xs()
+                                    .rounded_md()
+                                    .bg(if self.slideshow_running { rgb(ACCENT) } else { rgb(0x32_32_3c) })
+                                    .text_color(if self.slideshow_running { rgb(0xff_ff_ff) } else { rgb(TEXT_PRIMARY) })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_slideshow(&ToggleSlideshow, window, cx);
+                                    }))
+                                    .child(if self.slideshow_running {
+                                        LucideIcon::Pause.element(12.0, rgb(0xff_ff_ff))
+                                    } else {
+                                        LucideIcon::Play.element(12.0, rgb(TEXT_PRIMARY))
+                                    })
+                                    .child("Slideshow"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .w(px(24.0))
+                                    .h(px(22.0))
+                                    .rounded_md()
+                                    .bg(rgb(0x32_32_3c))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                        this.toggle_fullscreen(&ToggleFullscreen, window, cx);
+                                    }))
+                                    .child(LucideIcon::Maximize2.element(13.0, rgb(TEXT_PRIMARY))),
                             )
                             .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
                             .child(

@@ -23,6 +23,7 @@ pub struct ImageMetadata {
     pub iso: Option<String>,
     pub focal_length: Option<String>,
     pub date_time: Option<String>,
+    pub color_space: Option<String>,
 }
 
 impl ImageMetadata {
@@ -36,6 +37,13 @@ impl ImageMetadata {
                 .map(|f| f.display_value().to_string().trim_matches('"').to_string())
         };
 
+        let cs_str = get_field(exif::Tag::ColorSpace).map(|val| match val.as_str() {
+            "1" | "sRGB" => "sRGB".to_string(),
+            "2" | "Adobe RGB" => "Adobe RGB (1998)".to_string(),
+            "65535" | "Uncalibrated" => "Wide Gamut / Uncalibrated".to_string(),
+            other => other.to_string(),
+        });
+
         Some(Self {
             make: get_field(exif::Tag::Make),
             model: get_field(exif::Tag::Model),
@@ -47,6 +55,7 @@ impl ImageMetadata {
             focal_length: get_field(exif::Tag::FocalLength),
             date_time: get_field(exif::Tag::DateTimeOriginal)
                 .or_else(|| get_field(exif::Tag::DateTime)),
+            color_space: cs_str,
         })
     }
 
@@ -59,6 +68,7 @@ impl ImageMetadata {
             && self.iso.is_none()
             && self.focal_length.is_none()
             && self.date_time.is_none()
+            && self.color_space.is_none()
     }
 
     /// The camera's own EXIF block, byte for byte: `Exif\0\0` followed by the TIFF

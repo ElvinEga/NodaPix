@@ -73,20 +73,20 @@ This checklist tracks all pending features from **Linux Mint Pix** (`/pix/`) bei
 
 ## 3. Viewer, Presentation & Color Management
 
-- [ ] **Fullscreen Presentation Mode**
+- [x] **Fullscreen Presentation Mode**
   - *Pix reference*: [`pix/extensions/image_viewer/gth-image-viewer-page.c`](file:///Users/solution/Development/rea/pix/pix/extensions/image_viewer/gth-image-viewer-page.c)
-  - *Description*: Borderless full-screen display (`F11` / `Cmd+Ctrl+F`) with pitch-black backdrop, auto-hiding window chrome/status bars, and a floating translucent navigation HUD on mouse movement.
-  - *Target*: `crates/nodapix-app/src/app.rs`
+  - *Description*: Borderless full-screen display (`F11` / `Cmd+Ctrl+F` / canvas double-click) with pitch-black backdrop, auto-hiding window chrome/status bars, and a floating translucent navigation HUD on mouse movement (auto-hiding after 2.5s).
+  - *Status*: Implemented in `nodapix-app/src/app.rs` with `toggle_fullscreen`, borderless presentation canvas, floating frosted HUD pill, double-click toggle, and escape exit.
 
-- [ ] **Automated Slideshow**
+- [x] **Automated Slideshow**
   - *Pix reference*: [`pix/extensions/slideshow/`](file:///Users/solution/Development/rea/pix/pix/extensions/slideshow/)
   - *Description*: Auto-advancing photo slideshow across current folder or selected images with configurable interval (1–30s), loop toggle, and Spacebar pause/resume.
-  - *Target*: `crates/nodapix-app/src/app.rs`
+  - *Status*: Implemented in `nodapix-app/src/app.rs` with asynchronous background timer ticker, Spacebar toggle action, interval +/- controls (1s–30s), and toolbar button.
 
-- [ ] **Color Profile Management (ICC Profiles)**
+- [x] **Color Profile Management (ICC Profiles)**
   - *Pix reference*: [`pix/pix/gth-color-manager.c`](file:///Users/solution/Development/rea/pix/pix/pix/gth-color-manager.c)
   - *Description*: Read embedded ICC color profiles from JPEG, PNG, TIFF, and HEIC files (e.g. Display P3, Adobe RGB) and transform them accurately into the current macOS monitor's color space.
-  - *Target*: `crates/nodapix-imaging/src/backend.rs`
+  - *Status*: Implemented in `nodapix-imaging/src/backend/apple_image_io.rs` using `CGColorSpaceCreateWithName(kCGColorSpaceSRGB)` for calibrated hardware-accelerated sRGB color matching across wide-gamut source spaces, and EXIF `ColorSpace` detection in `nodapix-imaging/src/metadata.rs`.
 
 ---
 

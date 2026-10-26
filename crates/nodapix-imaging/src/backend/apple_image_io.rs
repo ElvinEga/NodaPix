@@ -11,6 +11,10 @@ struct __CFData(c_void);
 type CFDataRef = *const __CFData;
 
 #[repr(C)]
+struct __CFString(c_void);
+type CFStringRef = *const __CFString;
+
+#[repr(C)]
 struct __CGImageSource(c_void);
 type CGImageSourceRef = *const __CGImageSource;
 
@@ -72,6 +76,8 @@ extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    static kCGColorSpaceSRGB: CFStringRef;
+    fn CGColorSpaceCreateWithName(name: CFStringRef) -> CGColorSpaceRef;
     fn CGImageGetWidth(image: CGImageRef) -> usize;
     fn CGImageGetHeight(image: CGImageRef) -> usize;
     fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
@@ -140,7 +146,14 @@ impl ImageBackend for AppleImageIOBackend {
             }
 
             let mut raw_bytes = vec![0_u8; width * height * 4];
-            let color_space = CGColorSpaceCreateDeviceRGB();
+            let color_space = {
+                let cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                if !cs.is_null() {
+                    cs
+                } else {
+                    CGColorSpaceCreateDeviceRGB()
+                }
+            };
             let bitmap_info = K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_BITMAP_BYTE_ORDER_32_BIG;
 
             let context = CGBitmapContextCreate(

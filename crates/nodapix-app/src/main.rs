@@ -17,8 +17,8 @@ use gpui::{
 use crate::actions::{
     ActualSize, ApplyCrop, AutoEnhance, CancelCrop, Export, Fit, FlipH, FlipV, NextImage, Open,
     PrevImage, Quit, Redo, ResetAdjustments, ResetAll, ResetCrop, RotateCCW, RotateCW, Save,
-    SaveAs, ToggleCompare, ToggleCrop, ToggleInfo, ToggleResize, ToggleSidebar,
-    ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
+    SaveAs, ToggleCompare, ToggleCrop, ToggleFullscreen, ToggleInfo, ToggleResize, ToggleSidebar,
+    ToggleSlideshow, ToggleThumbnailPane, Undo, ZoomIn, ZoomOut,
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
@@ -55,6 +55,9 @@ fn main() {
             KeyBinding::new("cmd-u", AutoEnhance, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-r", ToggleResize, Some(KEY_CONTEXT)),
             KeyBinding::new("f8", ToggleThumbnailPane, Some(KEY_CONTEXT)),
+            KeyBinding::new("f11", ToggleFullscreen, Some(KEY_CONTEXT)),
+            KeyBinding::new("cmd-ctrl-f", ToggleFullscreen, Some(KEY_CONTEXT)),
+            KeyBinding::new("space", ToggleSlideshow, Some(KEY_CONTEXT)),
             KeyBinding::new("left", PrevImage, Some(KEY_CONTEXT)),
             KeyBinding::new("right", NextImage, Some(KEY_CONTEXT)),
         ]);
@@ -93,6 +96,9 @@ fn main() {
                 MenuItem::action("Show Original", ToggleCompare),
                 MenuItem::action("Toggle Adjustments Panel", ToggleSidebar),
                 MenuItem::action("Toggle Thumbnail Pane", ToggleThumbnailPane),
+                MenuItem::separator(),
+                MenuItem::action("Fullscreen Presentation", ToggleFullscreen),
+                MenuItem::action("Play / Pause Slideshow", ToggleSlideshow),
             ]),
             Menu::new("Image").items(vec![
                 MenuItem::action("Auto Enhance", AutoEnhance),
