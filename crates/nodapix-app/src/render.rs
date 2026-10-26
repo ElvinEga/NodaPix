@@ -12,6 +12,8 @@ pub fn texture_from_rgba8(buffer: &PixelBuffer<u8>) -> Arc<RenderImage> {
     for pixel in data.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    let frame = Frame::from_rgba8(buffer.width, buffer.height, data);
+    let rgba = image::RgbaImage::from_raw(buffer.width, buffer.height, data)
+        .expect("valid buffer dimensions");
+    let frame = Frame::new(rgba);
     Arc::new(RenderImage::new(vec![frame]))
 }

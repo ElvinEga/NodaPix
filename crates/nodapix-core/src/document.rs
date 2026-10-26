@@ -3,7 +3,7 @@
 use crate::edit_state::EditState;
 use crate::history::HistoryStack;
 use crate::pipeline::execute_pipeline;
-use nodapix_imaging::{downsample_to_fit, OrthogonalRotation, PixelBuffer};
+use nodapix_imaging::{downsample_to_fit, PixelBuffer};
 use std::path::PathBuf;
 
 pub const PROXY_MAX_DIMENSION: u32 = 2048;
@@ -34,28 +34,6 @@ impl ImageDocument {
             history: HistoryStack::default(),
             file_path,
             is_dirty: false,
-        }
-    }
-
-    /// Dimensions the pipeline will produce, without rendering it.
-    /// Used by the viewport to lay out and scale the preview texture.
-    pub fn output_size(&self) -> (u32, u32) {
-        let swapped = matches!(
-            self.state.rotation,
-            OrthogonalRotation::Rotate90 | OrthogonalRotation::Rotate270
-        );
-        let (width, height) = if swapped {
-            (self.source.height, self.source.width)
-        } else {
-            (self.source.width, self.source.height)
-        };
-
-        match self.state.crop {
-            Some(crop) => {
-                let (_, _, w, h) = crop.to_pixel_coords(width, height);
-                (w, h)
-            }
-            None => (width, height),
         }
     }
 
@@ -109,5 +87,23 @@ impl ImageDocument {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled.png".to_string())
+    }
+
+    /// Calculate the resulting output dimensions after current rotation and crop.
+    pub fn output_size(&self) -> (u32, u32) {
+        let (mut w, mut h) = (self.source.width, self.source.height);
+        if matches!(
+            self.state.rotation,
+            nodapix_imaging::OrthogonalRotation::Rotate90
+                | nodapix_imaging::OrthogonalRotation::Rotate270
+        ) {
+            std::mem::swap(&mut w, &mut h);
+        }
+        if let Some(crop) = self.state.crop {
+            let (_, _, cw, ch) = crop.to_pixel_coords(w, h);
+            (cw, ch)
+        } else {
+            (w, h)
+        }
     }
 }

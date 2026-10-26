@@ -5,8 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, fill, point, px, size, Bounds, Corners, IntoElement, Pixels, Point, RenderImage,
-    Size, Styled, rgb,
+    canvas, div, fill, point, px, size, Bounds, Corners, ParentElement, Pixels, Point,
+    RenderImage, Size, Styled, rgb,
 };
 
 /// One image pixel maps to one point at `Percent(1.0)`. Retina displays sample the
@@ -48,7 +48,7 @@ impl Default for Viewport {
     fn default() -> Self {
         Self {
             texture: None,
-            image: size(px(1.0), px(1.0)),
+            image: size(1.0, 1.0),
             zoom: Zoom::Fit,
             pan: point(px(0.0), px(0.0)),
             backdrop: 0x1a1a_1c,
@@ -87,17 +87,23 @@ impl Viewport {
                             return;
                         };
 
+                        let avail_w = f32::from(bounds.size.width);
+                        let avail_h = f32::from(bounds.size.height);
                         let scale = match zoom {
                             Zoom::Percent(scale) => scale,
-                            Zoom::Fit => fit_scale(image, bounds.size),
+                            Zoom::Fit => fit_scale(image, size(avail_w, avail_h)),
                         };
                         let width = image.width * scale;
                         let height = image.height * scale;
 
                         // Pan is measured from the viewport centre, so a zoomed image
                         // stays anchored while resizing the window.
-                        let centre_x = bounds.origin.x.0 + bounds.size.width.0 / 2.0 + pan.x.0;
-                        let centre_y = bounds.origin.y.0 + bounds.size.height.0 / 2.0 + pan.y.0;
+                        let origin_x = f32::from(bounds.origin.x);
+                        let origin_y = f32::from(bounds.origin.y);
+                        let pan_x = f32::from(pan.x);
+                        let pan_y = f32::from(pan.y);
+                        let centre_x = origin_x + avail_w / 2.0 + pan_x;
+                        let centre_y = origin_y + avail_h / 2.0 + pan_y;
                         let dest = Bounds {
                             origin: point(px(centre_x - width / 2.0), px(centre_y - height / 2.0)),
                             size: size(px(width), px(height)),
