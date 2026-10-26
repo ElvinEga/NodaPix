@@ -1,0 +1,16 @@
+[package]
+name = "nodapix-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nodapix-imaging = { path = "../nodapix-imaging" }
+nodapix-core = { path = "../nodapix-core" }
+gpui.workspace = true
+gpui_platform.workspace = true
+rfd.workspace = true
+crossbeam-channel.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true

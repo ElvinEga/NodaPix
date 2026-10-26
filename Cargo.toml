@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nodapix-imaging",
+    "crates/nodapix-core",
+    "crates/nodapix-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["NodaPix Team"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+crossbeam-channel = "0.5"
+rfd = "0.15"
+# Pinned to the rev verified to build on Apple Silicon (see docs/spike-gpui.md).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "08cbb88a152c3751a43e853425a70e9f631a5918" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "08cbb88a152c3751a43e853425a70e9f631a5918" }
