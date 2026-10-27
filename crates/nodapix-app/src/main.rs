@@ -122,9 +122,9 @@ fn main() {
                 MenuItem::action("Flip Vertical", FlipV),
             ]),
             Menu::new("Tools").items(vec![
-                MenuItem::action("Batch Convert Format…", ToggleBatchConvert),
-                MenuItem::action("Batch Rename Series…", ToggleBatchRename),
-                MenuItem::action("Batch Adjust Date/Time…", ToggleBatchDate),
+                MenuItem::action("Convert Format…", ToggleBatchConvert),
+                MenuItem::action("Rename Series…", ToggleBatchRename),
+                MenuItem::action("Adjust Date/Time…", ToggleBatchDate),
                 MenuItem::separator(),
                 MenuItem::action("Find Duplicate Images…", ToggleFindDuplicates),
                 MenuItem::separator(),

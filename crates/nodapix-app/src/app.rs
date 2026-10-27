@@ -5435,7 +5435,7 @@ impl Editor {
                                             .text_base()
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Batch Convert Format"),
+                                            .child("Convert Format"),
                                     ),
                             )
                             .child(
@@ -5822,7 +5822,7 @@ impl Editor {
                                             .text_base()
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Batch Rename Series"),
+                                            .child("Rename Series"),
                                     ),
                             )
                             .child(
@@ -6199,7 +6199,7 @@ impl Editor {
                                             .text_base()
                                             .font_weight(gpui::FontWeight::BOLD)
                                             .text_color(rgb(TEXT_PRIMARY))
-                                            .child("Batch Adjust Date & Time"),
+                                            .child("Adjust Date & Time"),
                                     ),
                             )
                             .child(
@@ -8423,60 +8423,6 @@ impl Render for Editor {
                                     .child(LucideIcon::ChevronRight.element(13.0, if self.folder_images.len() > 1 { rgb(TEXT_PRIMARY) } else { rgb(MUTED) })),
                             )
                             .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(BORDER_COLOR)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py(px(3.0))
-                                    .text_xs()
-                                    .rounded_md()
-                                    .bg(rgb(0x32_32_3c))
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                        this.save(&Save, window, cx);
-                                    }))
-                                    .child(LucideIcon::Save.element(13.0, rgb(TEXT_PRIMARY)))
-                                    .child("Save"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py(px(3.0))
-                                    .text_xs()
-                                    .rounded_md()
-                                    .bg(rgb(0x32_32_3c))
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                        this.export(&Export, window, cx);
-                                    }))
-                                    .child(LucideIcon::Download.element(13.0, rgb(TEXT_PRIMARY)))
-                                    .child("Export…"),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py(px(3.0))
-                                    .text_xs()
-                                    .rounded_md()
-                                    .bg(rgb(0x32_32_3c))
-                                    .text_color(rgb(TEXT_PRIMARY))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                        this.toggle_resize(&ToggleResize, window, cx);
-                                    }))
-                                    .child(LucideIcon::Scaling.element(13.0, rgb(TEXT_PRIMARY)))
-                                    .child("Resize…"),
-                            )
                             .child(
                                 div()
                                     .flex()

@@ -78,10 +78,10 @@ Edits are never applied destructively to the source raster. Instead, every opera
 - **Folder Filmstrip Carousel (`F8`)**: Asynchronous background thumbnail cache for rapid browsing across folders.
 - **Visual Compare Mode (`Shift+\`)**: Instant A/B toggle between edited draft and raw original.
 
-### Batch Operations & File Utilities
-- **Batch Format Converter (`Cmd+Shift+C`)**: Converts image folders to JPEG, PNG, WebP, or TIFF with custom quality and background progress bars. Preserves camera EXIF metadata.
-- **Batch Series Renaming (`Cmd+Shift+R`)**: Pattern renamer supporting `#` padding (`###`), printf formats (`%04d`), original stems (`%F`), extensions (`%E`), dates (`%Y%m%d`), and case transformations with a live preview table.
-- **Batch EXIF Date Adjuster**: In-place timezone correction and timestamp offsetting using Howard Hinnant's civil date algorithm.
+### File Utilities & Conversions
+- **Convert Format (`Cmd+Shift+C`)**: Converts image folders to JPEG, PNG, WebP, or TIFF with custom quality and background progress bars. Preserves camera EXIF metadata.
+- **Rename Series (`Cmd+Shift+R`)**: Pattern renamer supporting `#` padding (`###`), printf formats (`%04d`), original stems (`%F`), extensions (`%E`), dates (`%Y%m%d`), and case transformations with a live preview table.
+- **Adjust Date/Time**: In-place timezone correction and timestamp offsetting using Howard Hinnant's civil date algorithm.
 - **Perceptual Duplicate Finder (`Cmd+Shift+D`)**: 64-bit difference hash (`dHash`, $9 \times 8$ luminance gradient, Hamming distance $\le 5$) and exact byte matching to group, inspect, and prune duplicates.
 
 ### Publishing & Export
@@ -115,8 +115,8 @@ Edits are never applied destructively to the source raster. Instead, every opera
 | **`F8`** | Toggle Thumbnail Carousel Filmstrip |
 | **`F11`** / **`Cmd + Ctrl + F`** | Toggle Fullscreen Presentation Mode |
 | **`Space`** | Play / Pause Slideshow |
-| **`Cmd + Shift + C`** | Open Batch Format Converter |
-| **`Cmd + Shift + R`** | Open Batch Series Renamer |
+| **`Cmd + Shift + C`** | Open Convert Format Dialog |
+| **`Cmd + Shift + R`** | Open Rename Series Dialog |
 | **`Cmd + Shift + D`** | Open Duplicate Image Finder |
 | **`Left Arrow`** / **`Right Arrow`** | Previous Image / Next Image |
 
