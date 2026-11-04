@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, fill, point, px, size, App, Bounds, Context, Corners, CursorStyle, ExternalPaths,
-    FocusHandle, Focusable, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta, ScrollEvent,
-    SharedString, Size, Styled, Window, prelude::*, rgb, rgba,
+    FocusHandle, Focusable, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, PinchEvent, Pixels, Point, Render, RenderImage, ScrollDelta,
+    ScrollEvent, SharedString, Size, Styled, Window, prelude::*, rgb, rgba,
 };
 use nodapix_core::{execute_pipeline, render_proxy_preview, EditState, ImageDocument};
 use nodapix_imaging::{
@@ -270,6 +270,21 @@ pub struct Editor {
 
     /// Last title pushed to the window, so the render loop only re-sets it on change.
     window_title: SharedString,
+
+    // Spinbox numeric editing and holding step
+    active_numeric_input: Option<NumericInputId>,
+    numeric_input_buffer: String,
+    hold_step_token: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumericInputId {
+    CropWidth,
+    CropHeight,
+    CropX,
+    CropY,
+    ResizeWidth,
+    ResizeHeight,
 }
 
 impl Editor {
@@ -332,6 +347,9 @@ impl Editor {
             contact_sheet: ContactSheetSettings::default(),
             print_modal: PrintModalSettings::default(),
             window_title: "NodaPix".into(),
+            active_numeric_input: None,
+            numeric_input_buffer: String::new(),
+            hold_step_token: 0,
         }
     }
 
@@ -339,7 +357,71 @@ impl Editor {
 
     pub fn open(&mut self, _: &Open, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new().set_title("Open Image").pick_file() {
+            self.open_path_with_save_prompt(path, cx);
+        }
+    }
+
+    pub fn open_path_with_save_prompt(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let dirty = self.document.as_ref().map_or(false, |d| d.is_dirty);
+        if !dirty {
             self.load(path, cx);
+            return;
+        }
+
+        let file_name = self
+            .document
+            .as_ref()
+            .and_then(|d| d.file_path.as_ref())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("image");
+
+        let res = rfd::MessageDialog::new()
+            .set_title("Unsaved Changes")
+            .set_description(format!(
+                "Do you want to save changes to \"{}\" before opening another image?",
+                file_name
+            ))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Save".into(),
+                "Don't Save".into(),
+                "Cancel".into(),
+            ))
+            .show();
+
+        match res {
+            rfd::MessageDialogResult::Custom(btn) if btn == "Save" => {
+                let (path_opt, format_opt) = match &self.document {
+                    Some(doc) => {
+                        let f = doc
+                            .file_path
+                            .as_ref()
+                            .and_then(|p| p.extension())
+                            .and_then(|e| e.to_str())
+                            .and_then(ExportFormat::from_extension);
+                        (doc.file_path.clone(), f)
+                    }
+                    None => (None, None),
+                };
+                if let (Some(cur_path), Some(fmt)) = (path_opt, format_opt) {
+                    self.begin_save(cur_path, fmt, cx);
+                    self.load(path, cx);
+                } else if let Some(target) = rfd::FileDialog::new().set_title("Save Image").save_file() {
+                    let fmt = target
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(ExportFormat::from_extension)
+                        .unwrap_or(ExportFormat::Png);
+                    self.begin_save(target, fmt, cx);
+                    self.load(path, cx);
+                }
+            }
+            rfd::MessageDialogResult::Custom(btn) if btn == "Don't Save" => {
+                self.load(path, cx);
+            }
+            _ => {
+                // Cancelled
+            }
         }
     }
 
@@ -482,10 +564,16 @@ impl Editor {
     }
 
     pub fn prev_image(&mut self, _: &PrevImage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_numeric_input.is_some() {
+            return;
+        }
         self.advance_prev_image(cx);
     }
 
     pub fn next_image(&mut self, _: &NextImage, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_numeric_input.is_some() {
+            return;
+        }
         self.advance_next_image(cx);
     }
 
@@ -495,6 +583,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_numeric_input.is_some() {
+            return;
+        }
         window.toggle_fullscreen();
         self.presentation_mode = !self.presentation_mode;
         if self.presentation_mode {
@@ -513,6 +604,9 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_numeric_input.is_some() {
+            return;
+        }
         self.slideshow_running = !self.slideshow_running;
         if self.slideshow_running {
             self.status = format!(
@@ -1257,6 +1351,9 @@ impl Editor {
     // ---------------------------------------------------------------- crop tools
 
     pub fn toggle_crop(&mut self, _: &ToggleCrop, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_numeric_input.is_some() {
+            return;
+        }
         if self.crop_mode {
             self.crop_mode = false;
             self.draft_crop = None;
@@ -1283,6 +1380,11 @@ impl Editor {
     }
 
     pub fn apply_crop(&mut self, _: &ApplyCrop, _: &mut Window, cx: &mut Context<Self>) {
+        if self.active_numeric_input.is_some() {
+            self.commit_active_numeric_input();
+            cx.notify();
+            return;
+        }
         if self.export_settings.is_open {
             self.perform_export(cx);
             return;
@@ -1307,6 +1409,11 @@ impl Editor {
     }
 
     pub fn cancel_crop(&mut self, _: &CancelCrop, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_numeric_input.is_some() {
+            self.cancel_active_numeric_input();
+            cx.notify();
+            return;
+        }
         if self.presentation_mode {
             self.presentation_mode = false;
             self.presentation_hud_visible = false;
@@ -1743,16 +1850,8 @@ impl Editor {
         }
     }
 
-    fn begin_pan(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if event.click_count == 2
-            && !self.crop_mode
-            && !self.horizon_mode
-            && !self.eyedropper_active
-            && self.active_tool_group != Some(ToolGroup::RedEye)
-        {
-            self.toggle_fullscreen(&ToggleFullscreen, window, cx);
-            return;
-        }
+    fn begin_pan(&mut self, event: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_active_numeric_input();
 
         if self.eyedropper_active {
             if let (Some(dest), Some(rendered)) = (self.image_dest.get(), &self.last_rendered_preview) {
@@ -2242,6 +2341,368 @@ impl Editor {
         }
     }
 
+    fn effective_crop(&self) -> CropRect {
+        self.draft_crop.unwrap_or(CropRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        })
+    }
+
+    pub fn current_numeric_value(&self, id: NumericInputId) -> u32 {
+        let (img_w, img_h) = self
+            .document
+            .as_ref()
+            .map(|d| d.output_size())
+            .unwrap_or((0, 0));
+        let crop = self.effective_crop();
+        let (cx, cy, cw, ch) = crop.to_pixel_coords(img_w, img_h);
+        match id {
+            NumericInputId::CropWidth => cw,
+            NumericInputId::CropHeight => ch,
+            NumericInputId::CropX => cx,
+            NumericInputId::CropY => cy,
+            NumericInputId::ResizeWidth => self.resize_settings.width,
+            NumericInputId::ResizeHeight => self.resize_settings.height,
+        }
+    }
+
+    pub fn start_numeric_input(&mut self, id: NumericInputId) {
+        self.commit_active_numeric_input();
+        let val = self.current_numeric_value(id);
+        self.active_numeric_input = Some(id);
+        self.numeric_input_buffer = val.to_string();
+    }
+
+    pub fn commit_active_numeric_input(&mut self) {
+        if let Some(id) = self.active_numeric_input.take() {
+            if let Ok(val) = self.numeric_input_buffer.parse::<u32>() {
+                self.apply_numeric_value(id, val);
+            }
+            self.numeric_input_buffer.clear();
+        }
+    }
+
+    pub fn cancel_active_numeric_input(&mut self) {
+        self.active_numeric_input = None;
+        self.numeric_input_buffer.clear();
+    }
+
+    pub fn apply_numeric_value(&mut self, id: NumericInputId, val: u32) {
+        match id {
+            NumericInputId::CropWidth => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (cx, cy, _, ch) = crop.to_pixel_coords(img_w, img_h);
+                let new_w = val.clamp(1, img_w.saturating_sub(cx));
+                let target_ratio = self.crop_preset.target_ratio(img_w as f32, img_h as f32, self.crop_portrait);
+                let new_h = if let Some(r) = target_ratio {
+                    ((new_w as f32 / r).round() as u32).min(img_h.saturating_sub(cy)).max(1)
+                } else {
+                    ch
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(cx, cy, new_w, new_h, img_w, img_h));
+            }
+            NumericInputId::CropHeight => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (cx, cy, cw, _) = crop.to_pixel_coords(img_w, img_h);
+                let new_h = val.clamp(1, img_h.saturating_sub(cy));
+                let target_ratio = self.crop_preset.target_ratio(img_w as f32, img_h as f32, self.crop_portrait);
+                let new_w = if let Some(r) = target_ratio {
+                    ((new_h as f32 * r).round() as u32).min(img_w.saturating_sub(cx)).max(1)
+                } else {
+                    cw
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(cx, cy, new_w, new_h, img_w, img_h));
+            }
+            NumericInputId::CropX => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (_, cy, cw, ch) = crop.to_pixel_coords(img_w, img_h);
+                let new_x = val.min(img_w.saturating_sub(cw));
+                self.draft_crop = Some(CropRect::from_pixel_coords(new_x, cy, cw, ch, img_w, img_h));
+            }
+            NumericInputId::CropY => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (cx, _, cw, ch) = crop.to_pixel_coords(img_w, img_h);
+                let new_y = val.min(img_h.saturating_sub(ch));
+                self.draft_crop = Some(CropRect::from_pixel_coords(cx, new_y, cw, ch, img_w, img_h));
+            }
+            NumericInputId::ResizeWidth => {
+                let orig_w = self.resize_settings.original_width.max(1);
+                let orig_h = self.resize_settings.original_height.max(1);
+                let new_w = val.clamp(1, 99999);
+                self.resize_settings.width = new_w;
+                if self.resize_settings.preserve_aspect_ratio {
+                    if self.resize_settings.unit_percent {
+                        self.resize_settings.height = new_w;
+                    } else {
+                        self.resize_settings.height = ((new_w as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
+                    }
+                }
+            }
+            NumericInputId::ResizeHeight => {
+                let orig_w = self.resize_settings.original_width.max(1);
+                let orig_h = self.resize_settings.original_height.max(1);
+                let new_h = val.clamp(1, 99999);
+                self.resize_settings.height = new_h;
+                if self.resize_settings.preserve_aspect_ratio {
+                    if self.resize_settings.unit_percent {
+                        self.resize_settings.width = new_h;
+                    } else {
+                        self.resize_settings.width = ((new_h as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn apply_numeric_step(&mut self, id: NumericInputId, step_direction: i32) {
+        match id {
+            NumericInputId::CropWidth => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
+                let step = self.crop_multiple_of.unwrap_or(1);
+                let new_w = if step_direction > 0 {
+                    (crop_w + step).min(img_w - crop_x)
+                } else {
+                    crop_w.saturating_sub(step).max(step)
+                };
+                let target_ratio = self.crop_preset.target_ratio(img_w as f32, img_h as f32, self.crop_portrait);
+                let new_h = if let Some(r) = target_ratio {
+                    ((new_w as f32 / r).round() as u32).min(img_h - crop_y)
+                } else {
+                    crop_h
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+            }
+            NumericInputId::CropHeight => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
+                let step = self.crop_multiple_of.unwrap_or(1);
+                let new_h = if step_direction > 0 {
+                    (crop_h + step).min(img_h - crop_y)
+                } else {
+                    crop_h.saturating_sub(step).max(step)
+                };
+                let target_ratio = self.crop_preset.target_ratio(img_w as f32, img_h as f32, self.crop_portrait);
+                let new_w = if let Some(r) = target_ratio {
+                    ((new_h as f32 * r).round() as u32).min(img_w - crop_x)
+                } else {
+                    crop_w
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
+            }
+            NumericInputId::CropX => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
+                let step = self.crop_multiple_of.unwrap_or(1);
+                let new_x = if step_direction > 0 {
+                    (crop_x + step).min(img_w.saturating_sub(crop_w))
+                } else {
+                    crop_x.saturating_sub(step)
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(new_x, crop_y, crop_w, crop_h, img_w, img_h));
+            }
+            NumericInputId::CropY => {
+                let Some(doc) = &self.document else { return; };
+                let (img_w, img_h) = doc.output_size();
+                let crop = self.effective_crop();
+                let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
+                let step = self.crop_multiple_of.unwrap_or(1);
+                let new_y = if step_direction > 0 {
+                    (crop_y + step).min(img_h.saturating_sub(crop_h))
+                } else {
+                    crop_y.saturating_sub(step)
+                };
+                self.draft_crop = Some(CropRect::from_pixel_coords(crop_x, new_y, crop_w, crop_h, img_w, img_h));
+            }
+            NumericInputId::ResizeWidth => {
+                let step = if self.resize_settings.unit_percent { 5 } else { 10 };
+                let orig_w = self.resize_settings.original_width.max(1);
+                let orig_h = self.resize_settings.original_height.max(1);
+                let new_w = if step_direction > 0 {
+                    (self.resize_settings.width + step).min(99999)
+                } else {
+                    self.resize_settings.width.saturating_sub(step).max(1)
+                };
+                self.resize_settings.width = new_w;
+                if self.resize_settings.preserve_aspect_ratio {
+                    if self.resize_settings.unit_percent {
+                        self.resize_settings.height = new_w;
+                    } else {
+                        self.resize_settings.height = ((new_w as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
+                    }
+                }
+            }
+            NumericInputId::ResizeHeight => {
+                let step = if self.resize_settings.unit_percent { 5 } else { 10 };
+                let orig_w = self.resize_settings.original_width.max(1);
+                let orig_h = self.resize_settings.original_height.max(1);
+                let new_h = if step_direction > 0 {
+                    (self.resize_settings.height + step).min(99999)
+                } else {
+                    self.resize_settings.height.saturating_sub(step).max(1)
+                };
+                self.resize_settings.height = new_h;
+                if self.resize_settings.preserve_aspect_ratio {
+                    if self.resize_settings.unit_percent {
+                        self.resize_settings.width = new_h;
+                    } else {
+                        self.resize_settings.width = ((new_h as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn start_holding_step(
+        &mut self,
+        id: NumericInputId,
+        step_direction: i32,
+        cx: &mut Context<Self>,
+    ) {
+        self.commit_active_numeric_input();
+        self.apply_numeric_step(id, step_direction);
+        cx.notify();
+
+        let token = self.hold_step_token.wrapping_add(1);
+        self.hold_step_token = token;
+
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            executor.timer(std::time::Duration::from_millis(350)).await;
+
+            let mut interval_ms: u64 = 100;
+            loop {
+                let should_continue = this
+                    .update(cx, |editor, cx| {
+                        if editor.hold_step_token != token {
+                            return false;
+                        }
+                        editor.apply_numeric_step(id, step_direction);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+
+                executor
+                    .timer(std::time::Duration::from_millis(interval_ms))
+                    .await;
+                if interval_ms > 25 {
+                    interval_ms = interval_ms.saturating_sub(10).max(25);
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn stop_holding_step(&mut self) {
+        self.hold_step_token = self.hold_step_token.wrapping_add(1);
+    }
+
+    fn render_spinbox(
+        &self,
+        id: NumericInputId,
+        val: u32,
+        suffix: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let is_editing = self.active_numeric_input == Some(id);
+        let display_str = if is_editing {
+            if self.numeric_input_buffer.is_empty() {
+                " ".to_string()
+            } else {
+                self.numeric_input_buffer.clone()
+            }
+        } else if suffix.is_empty() {
+            format!("{}", val)
+        } else {
+            format!("{} {}", val, suffix)
+        };
+
+        let border_color = if is_editing { 0x2f_80_ed } else { BORDER_COLOR };
+        let bg_color = if is_editing { 0x0f_0f_12 } else { 0x18_18_1c };
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .px_2()
+                    .py(px(2.0))
+                    .w(px(70.0))
+                    .text_center()
+                    .text_xs()
+                    .rounded_sm()
+                    .bg(rgb(bg_color))
+                    .border_1()
+                    .border_color(rgb(border_color))
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.start_numeric_input(id);
+                        cx.notify();
+                    }))
+                    .child(display_str),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py(px(2.0))
+                    .text_xs()
+                    .rounded_sm()
+                    .bg(rgb(0x2a_2a_33))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.start_holding_step(id, -1, cx);
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                        this.stop_holding_step();
+                    }))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
+                        this.stop_holding_step();
+                    }))
+                    .child("−"),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .py(px(2.0))
+                    .text_xs()
+                    .rounded_sm()
+                    .bg(rgb(0x2a_2a_33))
+                    .cursor(CursorStyle::PointingHand)
+                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                        this.start_holding_step(id, 1, cx);
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                        this.stop_holding_step();
+                    }))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| {
+                        this.stop_holding_step();
+                    }))
+                    .child("+"),
+            )
+    }
+
     fn render_crop_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
         let Some(document) = &self.document else {
             return div();
@@ -2255,7 +2716,7 @@ impl Editor {
             height: 1.0,
         });
         let (crop_x, crop_y, crop_w, crop_h) = crop.to_pixel_coords(img_w, img_h);
-        let step = self.crop_multiple_of.unwrap_or(1);
+        let _step = self.crop_multiple_of.unwrap_or(1);
         let current_preset = self.crop_preset;
         let is_portrait = self.crop_portrait;
         let multiple_of = self.crop_multiple_of;
@@ -2341,67 +2802,7 @@ impl Editor {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Width:"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(format!("{} px", crop_w)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_w = crop_w.saturating_sub(step).max(step);
-                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
-                                                        let new_h = if let Some(r) = target_ratio {
-                                                            ((new_w as f32 / r).round() as u32).min(img_h - crop_y)
-                                                        } else {
-                                                            crop_h
-                                                        };
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_w = (crop_w + step).min(img_w - crop_x);
-                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
-                                                        let new_h = if let Some(r) = target_ratio {
-                                                            ((new_w as f32 / r).round() as u32).min(img_h - crop_y)
-                                                        } else {
-                                                            crop_h
-                                                        };
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            ),
-                                    ),
+                                    .child(self.render_spinbox(NumericInputId::CropWidth, crop_w, "px", cx)),
                             )
                             // Height spinbox
                             .child(
@@ -2410,67 +2811,7 @@ impl Editor {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Height:"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(format!("{} px", crop_h)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_h = crop_h.saturating_sub(step).max(step);
-                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
-                                                        let new_w = if let Some(r) = target_ratio {
-                                                            ((new_h as f32 * r).round() as u32).min(img_w - crop_x)
-                                                        } else {
-                                                            crop_w
-                                                        };
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_h = (crop_h + step).min(img_h - crop_y);
-                                                        let target_ratio = this.crop_preset.target_ratio(img_w as f32, img_h as f32, this.crop_portrait);
-                                                        let new_w = if let Some(r) = target_ratio {
-                                                            ((new_h as f32 * r).round() as u32).min(img_w - crop_x)
-                                                        } else {
-                                                            crop_w
-                                                        };
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, crop_y, new_w, new_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            ),
-                                    ),
+                                    .child(self.render_spinbox(NumericInputId::CropHeight, crop_h, "px", cx)),
                             )
                             // Position X spinbox
                             .child(
@@ -2479,55 +2820,7 @@ impl Editor {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Position X:"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(format!("{} px", crop_x)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_x = crop_x.saturating_sub(step);
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(new_x, crop_y, crop_w, crop_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_x = (crop_x + step).min(img_w.saturating_sub(crop_w));
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(new_x, crop_y, crop_w, crop_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            ),
-                                    ),
+                                    .child(self.render_spinbox(NumericInputId::CropX, crop_x, "px", cx)),
                             )
                             // Position Y spinbox
                             .child(
@@ -2536,55 +2829,7 @@ impl Editor {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Position Y:"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(format!("{} px", crop_y)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_y = crop_y.saturating_sub(step);
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, new_y, crop_w, crop_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(2.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let new_y = (crop_y + step).min(img_h.saturating_sub(crop_h));
-                                                        this.draft_crop = Some(CropRect::from_pixel_coords(crop_x, new_y, crop_w, crop_h, img_w, img_h));
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            ),
-                                    ),
+                                    .child(self.render_spinbox(NumericInputId::CropY, crop_y, "px", cx)),
                             )
                             // Maximize & Center action buttons
                             .child(
@@ -4279,7 +4524,7 @@ impl Editor {
     }
 
     fn render_resize_modal(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let (orig_w, orig_h) = self.document.as_ref().map(|d| d.output_size()).unwrap_or((1, 1));
+        let (_orig_w, _orig_h) = self.document.as_ref().map(|d| d.output_size()).unwrap_or((1, 1));
         let width = self.resize_settings.width;
         let height = self.resize_settings.height;
         let unit_pct = self.resize_settings.unit_percent;
@@ -4373,60 +4618,12 @@ impl Editor {
                                             .flex()
                                             .items_center()
                                             .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(if unit_pct { format!("{}%", width) } else { format!("{}", width) }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let step = if unit_pct { 5 } else { 10 };
-                                                        this.resize_settings.width = width.saturating_sub(step).max(1);
-                                                        if this.resize_settings.preserve_aspect_ratio {
-                                                            this.resize_settings.height = ((this.resize_settings.width as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let step = if unit_pct { 5 } else { 10 };
-                                                        this.resize_settings.width = (width + step).min(99999);
-                                                        if this.resize_settings.preserve_aspect_ratio {
-                                                            this.resize_settings.height = ((this.resize_settings.width as f64 * orig_h as f64 / orig_w as f64).round() as u32).max(1);
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            )
+                                            .child(self.render_spinbox(NumericInputId::ResizeWidth, width, if unit_pct { "%" } else { "" }, cx))
                                             // Unit selector
                                             .child(
                                                 div()
                                                     .px_2()
-                                                    .py(px(3.0))
+                                                    .py(px(2.0))
                                                     .text_xs()
                                                     .rounded_sm()
                                                     .bg(rgb(0x2a_2a_33))
@@ -4434,6 +4631,7 @@ impl Editor {
                                                     .border_color(rgb(BORDER_COLOR))
                                                     .cursor(CursorStyle::PointingHand)
                                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                        this.commit_active_numeric_input();
                                                         this.resize_settings.unit_percent = !this.resize_settings.unit_percent;
                                                         if this.resize_settings.unit_percent {
                                                             this.resize_settings.width = 100;
@@ -4455,61 +4653,7 @@ impl Editor {
                                     .items_center()
                                     .justify_between()
                                     .child(div().text_xs().text_color(rgb(TEXT_MUTED)).child("Height:"))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .w(px(70.0))
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x18_18_1c))
-                                                    .border_1()
-                                                    .border_color(rgb(BORDER_COLOR))
-                                                    .child(if unit_pct { format!("{}%", height) } else { format!("{}", height) }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let step = if unit_pct { 5 } else { 10 };
-                                                        this.resize_settings.height = height.saturating_sub(step).max(1);
-                                                        if this.resize_settings.preserve_aspect_ratio {
-                                                            this.resize_settings.width = ((this.resize_settings.height as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child("−"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px_2()
-                                                    .py(px(3.0))
-                                                    .text_xs()
-                                                    .rounded_sm()
-                                                    .bg(rgb(0x2a_2a_33))
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                        let step = if unit_pct { 5 } else { 10 };
-                                                        this.resize_settings.height = (height + step).min(99999);
-                                                        if this.resize_settings.preserve_aspect_ratio {
-                                                            this.resize_settings.width = ((this.resize_settings.height as f64 * orig_w as f64 / orig_h as f64).round() as u32).max(1);
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child("+"),
-                                            ),
-                                    ),
+                                    .child(self.render_spinbox(NumericInputId::ResizeHeight, height, if unit_pct { "%" } else { "" }, cx)),
                             )
                             // Preserve aspect ratio checkbox
                             .child(
@@ -8124,7 +8268,42 @@ impl Render for Editor {
             .on_action(cx.listener(Self::toggle_batch_date))
             .on_action(cx.listener(Self::toggle_find_duplicates))
             .on_action(cx.listener(Self::toggle_contact_sheet))
-            .on_action(cx.listener(Self::toggle_print_modal));
+            .on_action(cx.listener(Self::toggle_print_modal))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if let Some(active_id) = this.active_numeric_input {
+                    let key = event.keystroke.key.as_str();
+                    match key {
+                        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                            if this.numeric_input_buffer.len() < 7 {
+                                this.numeric_input_buffer.push_str(key);
+                                if let Ok(val) = this.numeric_input_buffer.parse::<u32>() {
+                                    this.apply_numeric_value(active_id, val);
+                                }
+                                cx.notify();
+                            }
+                        }
+                        "backspace" => {
+                            this.numeric_input_buffer.pop();
+                            if let Ok(val) = this.numeric_input_buffer.parse::<u32>() {
+                                this.apply_numeric_value(active_id, val);
+                            }
+                            cx.notify();
+                        }
+                        "enter" => {
+                            this.commit_active_numeric_input();
+                            cx.notify();
+                        }
+                        "escape" => {
+                            this.cancel_active_numeric_input();
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                }
+            }))
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| {
+                this.stop_holding_step();
+            }));
 
         // Fullscreen presentation view
         if self.presentation_mode {
