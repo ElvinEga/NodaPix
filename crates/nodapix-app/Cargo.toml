@@ -15,6 +15,8 @@ gpui.workspace = true
 gpui_macos = { workspace = true, features = ["runtime_shaders", "font-kit"] }
 rfd.workspace = true
 crossbeam-channel.workspace = true
+async-channel.workspace = true
+url.workspace = true
 image.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -2148,6 +2148,7 @@ dependencies = [
 name = "nodapix-app"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "crossbeam-channel",
  "gpui",
  "gpui_macos",
@@ -2157,6 +2158,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "url",
 ]
 
 [[package]]
