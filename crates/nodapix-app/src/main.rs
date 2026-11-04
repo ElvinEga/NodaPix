@@ -11,6 +11,7 @@ mod render;
 
 use std::path::PathBuf;
 
+use async_channel::unbounded;
 use gpui::{
     App, AppContext, Bounds, Focusable, KeyBinding, Menu, MenuItem, SystemMenuType, TitlebarOptions,
     WindowBounds, WindowOptions, px, size,
@@ -25,10 +26,37 @@ use crate::actions::{
 };
 use crate::app::{Editor, KEY_CONTEXT};
 
+fn url_to_path(raw: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(raw) {
+        if url.scheme() == "file" {
+            if let Ok(path) = url.to_file_path() {
+                return Some(path);
+            }
+        }
+    }
+    let p = PathBuf::from(raw);
+    if p.exists() {
+        return Some(p);
+    }
+    None
+}
+
 fn main() {
     // GPUI's backends are separate crates at this revision; macOS must be chosen explicitly.
     let platform = std::rc::Rc::new(gpui_macos::MacPlatform::new(false));
-    gpui::Application::with_platform(platform).run(|cx: &mut App| {
+    let app = gpui::Application::with_platform(platform);
+
+    let (open_tx, open_rx) = unbounded::<PathBuf>();
+    let tx_for_open = open_tx.clone();
+    app.on_open_urls(move |urls| {
+        for u in urls {
+            if let Some(path) = url_to_path(&u) {
+                let _ = tx_for_open.send_blocking(path);
+            }
+        }
+    });
+
+    app.run(move |cx: &mut App| {
         let editor = cx.new(|cx| Editor::new(cx));
 
         cx.on_action(|_: &Quit, cx| cx.quit());
@@ -61,6 +89,7 @@ fn main() {
             KeyBinding::new("f8", ToggleThumbnailPane, Some(KEY_CONTEXT)),
             KeyBinding::new("f11", ToggleFullscreen, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-ctrl-f", ToggleFullscreen, Some(KEY_CONTEXT)),
+            KeyBinding::new("f", ToggleFullscreen, Some(KEY_CONTEXT)),
             KeyBinding::new("space", ToggleSlideshow, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-c", ToggleBatchConvert, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-r", ToggleBatchRename, Some(KEY_CONTEXT)),
@@ -152,8 +181,28 @@ fn main() {
         )
         .expect("failed to open the editor window");
 
-        if let Some(path) = std::env::args().nth(1) {
-            editor.update(cx, |editor, cx| editor.load(PathBuf::from(path), cx));
+        let editor_for_open = editor.clone();
+        cx.spawn(|cx: &mut gpui::AsyncApp| {
+            let cx = cx.clone();
+            async move {
+                while let Ok(path) = open_rx.recv().await {
+                    let _ = cx.update(|app| {
+                        editor_for_open.update(app, |editor, cx| {
+                            editor.open_path_with_save_prompt(path, cx);
+                        });
+                    });
+                }
+            }
+        })
+        .detach();
+
+        if let Some(arg) = std::env::args().nth(1) {
+            if !arg.starts_with("-psn") {
+                let p = PathBuf::from(arg);
+                if p.exists() {
+                    let _ = open_tx.send_blocking(p);
+                }
+            }
         }
 
         cx.activate(true);
