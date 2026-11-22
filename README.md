@@ -2,6 +2,8 @@
 
 NodaPix is a fast, native macOS image viewer and non-destructive photo editor written in Rust. Built on [GPUI](https://github.com/zed-industries/zed) and Apple Metal, it re-engineers the feature set of Linux Mint's Pix (and gThumb) into a modern macOS application with zero-degradation parametric edits, Apple Silicon hardware decoding, and clean AppKit integration.
 
+![NodaPix Screenshot](assets/screenshot.png)
+
 ---
 
 ## Architecture Overview
