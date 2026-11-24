@@ -425,6 +425,108 @@ impl Editor {
         }
     }
 
+    pub fn save_sync(&self, path: &Path, format: ExportFormat) -> Result<(), String> {
+        let Some(document) = &self.document else {
+            return Ok(());
+        };
+        let source = document.source.clone();
+        let state = document.state.clone();
+        let quality = self.export_settings.quality;
+        let exif = self.exif_block.clone();
+        let rendered = execute_pipeline(&source, &state);
+        let bytes = NativeBackend::new()
+            .encode_to_bytes(&rendered, &ExportOptions { format, quality })
+            .map_err(|e| e.to_string())?;
+        let bytes_with_exif = with_exif(bytes, format, exif.as_deref());
+        write_atomically(&bytes_with_exif, path)?;
+        Ok(())
+    }
+
+    /// Checks if the current document has unsaved edits, prompting the user if dirty.
+    /// Returns `true` if quitting or closing should proceed, or `false` if cancelled.
+    pub fn confirm_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        let dirty = self.document.as_ref().map_or(false, |d| d.is_dirty);
+        if !dirty {
+            return true;
+        }
+
+        let file_name = self
+            .document
+            .as_ref()
+            .and_then(|d| d.file_path.as_ref())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("Untitled");
+
+        let res = rfd::MessageDialog::new()
+            .set_title("Unsaved Changes")
+            .set_description(format!(
+                "Do you want to save the changes made to the document \"{}\"?\nYour changes will be lost if you don't save them.",
+                file_name
+            ))
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Save".into(),
+                "Don't Save".into(),
+                "Cancel".into(),
+            ))
+            .show();
+
+        match res {
+            rfd::MessageDialogResult::Custom(btn) if btn == "Save" => {
+                let cur_path = self.document.as_ref().and_then(|d| d.file_path.clone());
+                if let Some(path) = cur_path {
+                    let format = path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(ExportFormat::from_extension)
+                        .unwrap_or(ExportFormat::Png);
+                    match self.save_sync(&path, format) {
+                        Ok(()) => {
+                            if let Some(doc) = &mut self.document {
+                                doc.is_dirty = false;
+                            }
+                            true
+                        }
+                        Err(err) => {
+                            self.status = format!("Save failed: {err}").into();
+                            cx.notify();
+                            false
+                        }
+                    }
+                } else if let Some(target) = rfd::FileDialog::new().set_title("Save Image").save_file() {
+                    let format = target
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(ExportFormat::from_extension)
+                        .unwrap_or(ExportFormat::Png);
+                    match self.save_sync(&target, format) {
+                        Ok(()) => {
+                            if let Some(doc) = &mut self.document {
+                                doc.file_path = Some(target);
+                                doc.is_dirty = false;
+                            }
+                            true
+                        }
+                        Err(err) => {
+                            self.status = format!("Save failed: {err}").into();
+                            cx.notify();
+                            false
+                        }
+                    }
+                } else {
+                    false
+                }
+            }
+            rfd::MessageDialogResult::Custom(btn) if btn == "Don't Save" => {
+                if let Some(doc) = &mut self.document {
+                    doc.is_dirty = false;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         match NativeBackend::new().decode_from_path(&path) {
             Ok(source) => {
