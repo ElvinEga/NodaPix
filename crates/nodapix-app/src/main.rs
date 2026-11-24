@@ -59,9 +59,16 @@ fn main() {
     app.run(move |cx: &mut App| {
         let editor = cx.new(|cx| Editor::new(cx));
 
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        let editor_for_quit = editor.clone();
+        cx.on_action(move |_: &Quit, cx| {
+            let should_quit = editor_for_quit.update(cx, |editor, cx| editor.confirm_quit(cx));
+            if should_quit {
+                cx.quit();
+            }
+        });
 
         cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", Open, None),
             KeyBinding::new("cmd-s", Save, Some(KEY_CONTEXT)),
             KeyBinding::new("cmd-shift-s", Export, Some(KEY_CONTEXT)),
@@ -173,8 +180,19 @@ fn main() {
             },
             {
                 let editor = editor.clone();
+                let editor_for_close = editor.clone();
                 move |window, cx| {
                     window.focus(&editor.focus_handle(cx), cx);
+                    window.on_window_should_close(cx, move |_window, app| {
+                        let should_close =
+                            editor_for_close.update(app, |editor, cx| editor.confirm_quit(cx));
+                        if should_close {
+                            app.quit();
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     editor
                 }
             },
